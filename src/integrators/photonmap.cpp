@@ -132,11 +132,11 @@ struct RadiancePhotonProcess {
 
 inline Float kernel(const Photon *photon, const Point3f &p, Float maxDist2);
 
-static Spectrum LPhoton(KdTree<Photon> *map, int nPaths, int nLookup,
+static Spectrum LPhoton(KdTree<Photon> const* map, int nPaths, int nLookup,
                         ClosePhoton *lookupBuf, BSDF *bsdf, RNG &rng, const SurfaceInteraction &isect,
                         const Vector3f &w, Float maxDistSquared);
 
-static Spectrum EPhoton(KdTree<Photon> *map, int count, int nLookup,
+static Spectrum EPhoton(KdTree<Photon> const* map, int count, int nLookup,
                         ClosePhoton *lookupBuf, Float maxDist2, const Point3f &p, const Normal3f &n);
 
 // PhotonIntegrator Local Definitions
@@ -171,7 +171,7 @@ inline Float kernel(const Photon *photon, const Point3f &p,
 }
 
 
-Spectrum LPhoton(KdTree<Photon> *map, int nPaths, int nLookup,
+Spectrum LPhoton(KdTree<Photon> const* map, int nPaths, int nLookup,
                  ClosePhoton *lookupBuf, BSDF *bsdf, Sampler &sampler,
                  const SurfaceInteraction &isect, const Vector3f &wo, Float maxDist2) {
     Spectrum L(0.);
@@ -222,7 +222,7 @@ Spectrum LPhoton(KdTree<Photon> *map, int nPaths, int nLookup,
 }
 
 
-Spectrum EPhoton(KdTree<Photon> *map, int count, int nLookup,
+Spectrum EPhoton(KdTree<Photon> const* map, int count, int nLookup,
                  ClosePhoton *lookupBuf, Float maxDist2, const Point3f &p,
                  const Normal3f &n) {
     if (!map) return 0.f;
@@ -278,331 +278,44 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
     int const numLights = scene.lights.size();
     if (numLights == 0) return;
 
-
-    // compute power-based probability distribution of lights
-    std::vector<Float> lightPbs(numLights);
-    Float sumLightPowers = 0.0;
-    for (int i = 0; i < numLights; ++i) {
-        lightPbs[i] = scene.lights[i]->Power().MaxComponentValue();
-        sumLightPowers += lightPbs[i];
-
-        // Compute number of samples to use for each light
-        nLightSamples.push_back(sampler.RoundCount(scene.lights[i]->nSamples));
-    }
-    DCHECK_GT(sumLightPowers, 0.0);
-    for (int i = 0; i < numLights; ++i) {
-        lightPbs[i] /= sumLightPowers;
-    }
-    lightDistr = std::unique_ptr<Distribution1D>(new Distribution1D(lightPbs.data(), numLights));
-
-//    // Request samples for sampling all lights
-//    for (int i = 0; i < maxDepth; ++i) {
-//        for (size_t j = 0; j < scene.lights.size(); ++j) {
-//            sampler.Request2DArray(nLightSamples[j]);
-//            sampler.Request2DArray(nLightSamples[j]);
-//        }
-//    }
-
+    ComputeLightSamples(scene, sampler);
+    ComputeLightPhotonDistrib(scene);
 
     // Declare shared variables for photon shooting
-    Mutex mutex;
     int nDirectPaths = 0;
+    uint32_t nshot = 0;
+    int nTasks = 0;
     std::vector<Photon> causticPhotons, directPhotons, indirectPhotons;
     std::vector<RadiancePhoton> radiancePhotons;
-    bool abortTasks = false;
     causticPhotons.reserve(nCausticPhotonsWanted);
     indirectPhotons.reserve(nIndirectPhotonsWanted);
-    uint32_t nshot = 0;
     std::vector<Spectrum> rpReflectances, rpTransmittances;
 
-    // Create HaltonSampler for generating photons
-    HaltonSampler photonSampler(std::numeric_limits<int>::max(), Bounds2i(Point2i(0, 0), Point2i(1, 1)));
-
-    // Run parallel tasks for photon shooting
     ProgressReporter progress(nCausticPhotonsWanted + nIndirectPhotonsWanted, "Shooting photons");
-    int nTasks = NumSystemCores();
-    ParallelFor([&](int i_task) {
-        std::unique_ptr<Sampler> localSampler = photonSampler.Clone(i_task);
-        localSampler->StartPixel(Point2i());
-        int64_t sampleNumber = i_task;
-        localSampler->SetSampleNumber(sampleNumber);
+    ShootPhotons(scene,
+                 causticPhotons, directPhotons, indirectPhotons, radiancePhotons,
+                 rpReflectances, rpTransmittances,
+                 nDirectPaths, nshot, nTasks,
+                 progress);
 
-        // Loop until desired number of photons met:
-        // 1. shoot n photons
-        // 2. append local direct, indirect and caustic photon vectors to global vectors
+    KdTree<Photon> *directMap = BuildPhotonMaps(directPhotons, causticPhotons, indirectPhotons);
 
-        // Declare local variables for _PhotonShootingTask_
-        MemoryArena arena;
-        std::vector<Photon> localDirectPhotons, localIndirectPhotons, localCausticPhotons;
-        std::vector<RadiancePhoton> localRadiancePhotons;
-        uint32_t totalPaths = 0;
-        bool causticDone = (this->nCausticPhotonsWanted == 0);
-        bool indirectDone = (this->nIndirectPhotonsWanted == 0);
-        std::vector<Spectrum> localRpReflectances, localRpTransmittances;
+    if (finalGather && radiancePhotons.size() > 0) {
+        ComputePhotonRadiances(radiancePhotons,
+                               rpReflectances, rpTransmittances,
+                               directMap,
+                               nDirectPaths, nTasks,
+                               progress);
+    }
 
-        for (;;) {
-            // Follow photon paths for a block of samples
-            constexpr uint32_t BlockSize = 4096;
-            for (uint32_t i = 0; i < BlockSize; ++i) {
-                Float const u0 = localSampler->Get1D();
-                Point2f const &u12 = localSampler->Get2D();
-                Point2f const &u34 = localSampler->Get2D();
-
-                // Choose light to shoot photon from
-                Float lightPdf;
-                int lightNum = lightDistr->SampleDiscrete(u0, &lightPdf);
-                std::shared_ptr<Light> light = scene.lights[lightNum];
-
-                // Generate _photonRay_ from light source and initialize _alpha_
-                RayDifferential photonRay;
-                Vector3f wi;
-                Float pdfLightPos, pdfLightDir;
-                Normal3f nLight;
-                Spectrum Le = light->Sample_Le(u12, u34,
-                                               (camera ? camera->shutterOpen : 0.0f), &photonRay, &nLight, &pdfLightPos,
-                                               &pdfLightDir);
-
-                if (pdfLightPos == 0.0f || pdfLightDir == 0.0f || Le.IsBlack()) continue;
-                ++photonPaths;
-
-                Spectrum alpha = (AbsDot(nLight, photonRay.d) * Le) / (pdfLightDir * pdfLightPos * lightPdf);
-                if (!alpha.IsBlack()) {
-                    // Follow photon path through scene and record intersections
-                    bool specularPath = true;
-                    SurfaceInteraction photonIsect;
-                    int nIntersections = 0;
-                    while (scene.Intersect(photonRay, &photonIsect)) {
-                        ++nIntersections;
-                        ++totalPhotonSurfaceInteractions;
-
-                        // TODO investigate this?
-                        // TODO investigate this?
-                        // TODO investigate this?
-                        // TODO investigate this?
-                        // Compute scattering functions for surface interaction
-                        photonIsect.ComputeScatteringFunctions(photonRay, arena);
-                        if (!photonIsect.bsdf)
-                            break;
-
-                        // Handle photon/surface intersection
-                        // TODO update alpha with volume integrator transmittance
-                        // TODO => ray.medium.Tr(ray, sampler)
-                        // TODO use isect.SpawnRay(direction) !!!!!!!!
-                        if (photonRay.medium)
-                            alpha *= photonRay.medium->Tr(photonRay, sampler);
-                        BSDF *photonBSDF = photonIsect.bsdf;
-                        BxDFType specularType = BxDFType(BSDF_REFLECTION |
-                                                         BSDF_TRANSMISSION | BSDF_SPECULAR);
-                        bool hasNonSpecular = (photonBSDF->NumComponents() >
-                                               photonBSDF->NumComponents(specularType));
-                        if (hasNonSpecular) {
-                            // Deposit photon at surface
-                            Photon photon(photonIsect.p, alpha, -photonRay.d);
-                            bool depositedPhoton = false;
-                            if (specularPath && nIntersections > 1) {
-                                if (!causticDone) {
-                                    depositedPhoton = true;
-                                    localCausticPhotons.push_back(photon);
-                                }
-                            } else {
-                                // Deposit either direct or indirect photon
-                                // stop depositing direct photons once indirectDone is true; don't
-                                // want to waste memory storing too many if we're going a long time
-                                // trying to get enough caustic photons desposited.
-                                if (nIntersections == 1 && !indirectDone && this->finalGather) {
-                                    depositedPhoton = true;
-                                    localDirectPhotons.push_back(photon);
-                                } else if (nIntersections > 1 && !indirectDone) {
-                                    depositedPhoton = true;
-                                    localIndirectPhotons.push_back(photon);
-                                }
-                            }
-
-                            // Possibly create radiance photon at photon intersection Point3f
-                            if (depositedPhoton && this->finalGather &&
-                                localSampler->Get1D() < .125f) {
-                                Normal3f n = photonIsect.n;
-                                n = Faceforward(n, -photonRay.d);
-                                localRadiancePhotons.push_back(RadiancePhoton(photonIsect.p, n));
-
-                                constexpr int sqrtSamples = 6;
-                                constexpr int nSamples = sqrtSamples * sqrtSamples;
-                                auto s1 = GetSamples2D<nSamples>(*localSampler);
-                                auto s2 = GetSamples2D<nSamples>(*localSampler);
-                                Spectrum rho_r = photonBSDF->rho(nSamples, s1.data(), s2.data(),
-                                                                 BxDFType(BSDF_ALL_TYPES | BSDF_REFLECTION));
-                                localRpReflectances.push_back(rho_r);
-
-                                s1 = GetSamples2D<nSamples>(*localSampler);
-                                s2 = GetSamples2D<nSamples>(*localSampler);
-                                Spectrum rho_t = photonBSDF->rho(nSamples, s1.data(), s2.data(),
-                                                                 BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION));
-                                if (rho_r.HasNaNs() || rho_t.HasNaNs()) {
-                                    int a = 1;
-                                }
-                                localRpTransmittances.push_back(rho_t);
-                            }
-                        }
-                        if (nIntersections >= this->maxPhotonDepth) break;
-
-                        // Sample new photon ray direction
-                        Vector3f wi;
-                        Float pdf;
-                        BxDFType flags;
-                        Point2f uphoton = localSampler->Get2D();
-                        Spectrum fr = photonBSDF->Sample_f(-photonRay.d, &wi, uphoton, &pdfLightPos, BSDF_ALL, &flags);
-                        // TODO wi or -wi?
-                        // TODO wi or -wi?
-                        // TODO wi or -wi?
-                        // TODO wi or -wi?
-                        if (fr.IsBlack() || pdfLightPos == 0.f) break;
-                        Spectrum anew = alpha * fr *
-                                        AbsDot(wi, photonIsect.n) / pdfLightPos;
-
-                        // Possibly terminate photon path with Russian roulette
-                        Float continueProb = std::min(1.f, anew.y() / alpha.y());
-                        if (localSampler->Get1D() > continueProb)
-                            break;
-                        alpha = anew / continueProb;
-                        specularPath &= ((flags & BSDF_SPECULAR) != 0);
-
-                        if (indirectDone && !specularPath) break;
-                        photonRay = photonIsect.SpawnRay(wi);
-                    }
-                }
-                arena.Reset();
-                DCHECK(localSampler->SetSampleNumber(sampleNumber += nTasks));
-            }
-
-            // Merge local photon data with data in _PhotonIntegrator_
-            {
-                MutexLock lock(&mutex);
-
-                // If photons aren't required
-                // => Give up if we're not storing enough photons
-                // NOT guaranteed to ever complete if (requirePhotons == true)
-                if (abortTasks)
-                    return;
-                if (!requirePhotons && nshot > 500000 &&
-                    (unsuccessful(this->nCausticPhotonsWanted,
-                                  causticPhotons.size(), BlockSize) ||
-                     unsuccessful(this->nIndirectPhotonsWanted,
-                                  indirectPhotons.size(), BlockSize))) {
-                    Error("Unable to store enough photons.  Giving up.\n");
-                    causticPhotons.erase(causticPhotons.begin(), causticPhotons.end());
-                    indirectPhotons.erase(indirectPhotons.begin(), indirectPhotons.end());
-                    radiancePhotons.erase(radiancePhotons.begin(), radiancePhotons.end());
-                    abortTasks = true;
-                    return;
-                }
-                progress.Update(localIndirectPhotons.size() + localCausticPhotons.size());
-                nshot += BlockSize;
-
-                // Merge indirect photons into shared array
-                if (!indirectDone) {
-                    this->nIndirectPaths += BlockSize;
-                    for (uint32_t i = 0; i < localIndirectPhotons.size(); ++i)
-                        indirectPhotons.push_back(localIndirectPhotons[i]);
-                    localIndirectPhotons.erase(localIndirectPhotons.begin(),
-                                               localIndirectPhotons.end());
-                    if (indirectPhotons.size() >= this->nIndirectPhotonsWanted)
-                        indirectDone = true;
-                    nDirectPaths += BlockSize;
-                    for (uint32_t i = 0; i < localDirectPhotons.size(); ++i)
-                        directPhotons.push_back(localDirectPhotons[i]);
-                    localDirectPhotons.erase(localDirectPhotons.begin(),
-                                             localDirectPhotons.end());
-                }
-
-                // Merge direct, caustic, and radiance photons into shared array
-                if (!causticDone) {
-                    this->nCausticPaths += BlockSize;
-                    for (uint32_t i = 0; i < localCausticPhotons.size(); ++i)
-                        causticPhotons.push_back(localCausticPhotons[i]);
-                    localCausticPhotons.erase(localCausticPhotons.begin(), localCausticPhotons.end());
-                    if (causticPhotons.size() >= this->nCausticPhotonsWanted)
-                        causticDone = true;
-                }
-
-                for (uint32_t i = 0; i < localRadiancePhotons.size(); ++i)
-                    radiancePhotons.push_back(localRadiancePhotons[i]);
-                localRadiancePhotons.erase(localRadiancePhotons.begin(), localRadiancePhotons.end());
-                for (uint32_t i = 0; i < localRpReflectances.size(); ++i)
-                    rpReflectances.push_back(localRpReflectances[i]);
-                localRpReflectances.erase(localRpReflectances.begin(), localRpReflectances.end());
-                for (uint32_t i = 0; i < localRpTransmittances.size(); ++i)
-                    rpTransmittances.push_back(localRpTransmittances[i]);
-                localRpTransmittances.erase(localRpTransmittances.begin(), localRpTransmittances.end());
-            }
-
-            // Exit task if enough photons have been found
-            if (indirectDone && causticDone)
-                break;
-        }
-
-    }, nTasks);
-    progress.Done();
-
-    // Store stats
-    indirectPhotonCounter = static_cast<int64_t>(indirectPhotons.size());
-    causticPhotonCounter = static_cast<int64_t>(causticPhotons.size());
-    radiancePhotonCounter = static_cast<int64_t>(radiancePhotons.size());
-    volumePhotonCounter = 0;
-    photonMapBytes = sizeof(Photon) * (indirectPhotonCounter + causticPhotonCounter)
-                     + sizeof(RadiancePhoton) * radiancePhotonCounter;
-
-    // Build kd-trees for indirect and caustic photons
-    KdTree<Photon> *directMap = nullptr;
-    if (directPhotons.size() > 0)
-        directMap = new KdTree<Photon>(directPhotons);
-    if (causticPhotons.size() > 0)
-        causticMap = new KdTree<Photon>(causticPhotons);
-    if (indirectPhotons.size() > 0)
-        indirectMap = new KdTree<Photon>(indirectPhotons);
-
-    // Precompute radiance at a subset of the photons
-    if (finalGather && radiancePhotons.size()) {
-        // Launch tasks to compute photon radiances
-        ProgressReporter progRadiance(nTasks, "Computing photon radiances");
-        ParallelFor([&](uint32_t i_task) {
-            // Compute range of radiance photons to process in task
-            uint32_t taskSize = radiancePhotons.size() / nTasks;
-            uint32_t excess = radiancePhotons.size() % nTasks;
-            uint32_t rpStart = std::min(i_task, excess) * (taskSize + 1) +
-                               std::max(0, (int) i_task - (int) excess) * taskSize;
-            uint32_t rpEnd = rpStart + taskSize + (i_task < excess ? 1 : 0);
-            if (i_task == nTasks - 1) DCHECK_EQ(rpEnd, radiancePhotons.size());
-            ClosePhoton *lookupBuf = new ClosePhoton[nLookup];
-            for (uint32_t i = rpStart; i < rpEnd; ++i) {
-                // Compute radiance for radiance photon _i_
-                RadiancePhoton &rp = radiancePhotons[i];
-                const Spectrum &rho_r = rpReflectances[i], &rho_t = rpTransmittances[i];
-                if (!rho_r.IsBlack()) {
-                    // Accumulate outgoing radiance due to reflected irradiance
-                    Spectrum E = EPhoton(directMap, nDirectPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, rp.n) +
-                                 EPhoton(indirectMap, nIndirectPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, rp.n) +
-                                 EPhoton(causticMap, nCausticPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, rp.n);
-                    rp.Lo += InvPi * rho_r * E;
-                }
-                if (!rho_t.IsBlack()) {
-                    // Accumulate outgoing radiance due to transmitted irradiance
-                    Spectrum E = EPhoton(directMap, nDirectPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, -rp.n) +
-                                 EPhoton(indirectMap, nIndirectPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, -rp.n) +
-                                 EPhoton(causticMap, nCausticPaths, nLookup, lookupBuf,
-                                         maxDistSquared, rp.p, -rp.n);
-                    rp.Lo += InvPi * rho_t * E;
-                }
-            }
-            delete[] lookupBuf;
-            progress.Update();
-        }, 64, 1);
-        progRadiance.Done();
-        radianceMap = new KdTree<RadiancePhoton>(radiancePhotons);
+    {
+        // Update PhotonMapping stats
+        indirectPhotonCounter = static_cast<int64_t>(indirectPhotons.size());
+        causticPhotonCounter = static_cast<int64_t>(causticPhotons.size());
+        radiancePhotonCounter = static_cast<int64_t>(radiancePhotons.size());
+        volumePhotonCounter = 0;
+        photonMapBytes = sizeof(Photon) * (indirectPhotonCounter + causticPhotonCounter)
+                         + sizeof(RadiancePhoton) * radiancePhotonCounter;
     }
 
     delete directMap;
@@ -793,6 +506,339 @@ Spectrum PhotonIntegrator::Li(const RayDifferential &ray,
         L += SpecularTransmit(ray, isect, scene, sampler, arena, depth);
     }
     return L;
+}
+
+
+void PhotonIntegrator::ComputeLightSamples(const Scene &scene, Sampler &sampler) {
+    for (int i = 0; i < scene.lights.size(); ++i) {
+        // Compute number of samples to use for each light
+        nLightSamples.push_back(sampler.RoundCount(scene.lights[i]->nSamples));
+    }
+}
+
+
+void PhotonIntegrator::ComputeLightPhotonDistrib(Scene const &scene) {
+    // compute power-based probability distribution of lights
+    auto const numLights = scene.lights.size();
+
+    std::vector<Float> lightPbs(numLights);
+    Float sumLightPowers = 0.0;
+    for (int i = 0; i < numLights; ++i) {
+        lightPbs[i] = scene.lights[i]->Power().MaxComponentValue();
+        sumLightPowers += lightPbs[i];
+    }
+    DCHECK_GT(sumLightPowers, 0.0);
+    for (int i = 0; i < numLights; ++i) {
+        lightPbs[i] /= sumLightPowers;
+    }
+    lightDistr = std::unique_ptr<Distribution1D>(new Distribution1D(lightPbs.data(), numLights));
+}
+
+
+void
+PhotonIntegrator::ShootPhotons(Scene const& scene,
+                               std::vector<Photon> &causticPhotons,
+                               std::vector<Photon> &directPhotons,
+                               std::vector<Photon> &indirectPhotons,
+                               std::vector<RadiancePhoton> &radiancePhotons,
+                               std::vector<Spectrum> &rpReflectances, std::vector<Spectrum> &rpTransmittances,
+                               int &nDirectPaths, uint32_t &nShot, int &nTasks,
+                               ProgressReporter &progress) {
+    Mutex mutex;
+    nTasks = NumSystemCores();
+    bool abortTasks = false;
+
+    // Create HaltonSampler for generating photons
+    HaltonSampler photonSampler(std::numeric_limits<int>::max(), Bounds2i(Point2i(0, 0), Point2i(1, 1)));
+
+    // Run parallel tasks for photon shooting
+    ParallelFor([&](int i_task) {
+        std::unique_ptr<Sampler> localSampler = photonSampler.Clone(i_task);
+        localSampler->StartPixel(Point2i());
+        int64_t sampleNumber = i_task;
+        localSampler->SetSampleNumber(sampleNumber);
+
+        // Loop until desired number of photons met:
+        // 1. shoot n photons
+        // 2. append local direct, indirect and caustic photon vectors to global vectors
+
+        // Declare local variables for _PhotonShootingTask_
+        MemoryArena arena;
+        std::vector<Photon> localDirectPhotons, localIndirectPhotons, localCausticPhotons;
+        std::vector<RadiancePhoton> localRadiancePhotons;
+        uint32_t totalPaths = 0;
+        bool causticDone = (this->nCausticPhotonsWanted == 0);
+        bool indirectDone = (this->nIndirectPhotonsWanted == 0);
+        std::vector<Spectrum> localRpReflectances, localRpTransmittances;
+
+        for (;;) {
+            // Follow photon paths for a block of samples
+            constexpr uint32_t BlockSize = 4096;
+            for (uint32_t i = 0; i < BlockSize; ++i) {
+                Float const u0 = localSampler->Get1D();
+                Point2f const &u12 = localSampler->Get2D();
+                Point2f const &u34 = localSampler->Get2D();
+
+                // Choose light to shoot photon from
+                Float lightPdf;
+                int lightNum = lightDistr->SampleDiscrete(u0, &lightPdf);
+                std::shared_ptr<Light> light = scene.lights[lightNum];
+
+                // Generate _photonRay_ from light source and initialize _alpha_
+                RayDifferential photonRay;
+                Vector3f wi;
+                Float pdfLightPos, pdfLightDir;
+                Normal3f nLight;
+                Spectrum Le = light->Sample_Le(u12, u34,
+                                               (camera ? camera->shutterOpen : 0.0f), &photonRay, &nLight, &pdfLightPos,
+                                               &pdfLightDir);
+
+                if (pdfLightPos == 0.0f || pdfLightDir == 0.0f || Le.IsBlack()) continue;
+                ++photonPaths;
+
+                Spectrum alpha = (AbsDot(nLight, photonRay.d) * Le) / (pdfLightDir * pdfLightPos * lightPdf);
+                if (!alpha.IsBlack()) {
+                    // Follow photon path through scene and record intersections
+                    bool specularPath = true;
+                    SurfaceInteraction photonIsect;
+                    int nIntersections = 0;
+                    while (scene.Intersect(photonRay, &photonIsect)) {
+                        ++nIntersections;
+                        ++totalPhotonSurfaceInteractions;
+
+                        // TODO investigate this?
+                        // TODO investigate this?
+                        // TODO investigate this?
+                        // TODO investigate this?
+                        // Compute scattering functions for surface interaction
+                        photonIsect.ComputeScatteringFunctions(photonRay, arena);
+                        if (!photonIsect.bsdf)
+                            break;
+
+                        // Handle photon/surface intersection
+                        // TODO update alpha with volume integrator transmittance
+                        // TODO => ray.medium.Tr(ray, sampler)
+                        // TODO use isect.SpawnRay(direction) !!!!!!!!
+                        if (photonRay.medium)
+                            alpha *= photonRay.medium->Tr(photonRay, *localSampler);
+                        BSDF *photonBSDF = photonIsect.bsdf;
+                        BxDFType specularType = BxDFType(BSDF_REFLECTION |
+                                                         BSDF_TRANSMISSION | BSDF_SPECULAR);
+                        bool hasNonSpecular = (photonBSDF->NumComponents() >
+                                               photonBSDF->NumComponents(specularType));
+                        if (hasNonSpecular) {
+                            // Deposit photon at surface
+                            Photon photon(photonIsect.p, alpha, -photonRay.d);
+                            bool depositedPhoton = false;
+                            if (specularPath && nIntersections > 1) {
+                                if (!causticDone) {
+                                    depositedPhoton = true;
+                                    localCausticPhotons.push_back(photon);
+                                }
+                            } else {
+                                // Deposit either direct or indirect photon
+                                // stop depositing direct photons once indirectDone is true; don't
+                                // want to waste memory storing too many if we're going a long time
+                                // trying to get enough caustic photons desposited.
+                                if (nIntersections == 1 && !indirectDone && this->finalGather) {
+                                    depositedPhoton = true;
+                                    localDirectPhotons.push_back(photon);
+                                } else if (nIntersections > 1 && !indirectDone) {
+                                    depositedPhoton = true;
+                                    localIndirectPhotons.push_back(photon);
+                                }
+                            }
+
+                            // Possibly create radiance photon at photon intersection Point3f
+                            if (depositedPhoton && this->finalGather &&
+                                localSampler->Get1D() < .125f) {
+                                Normal3f n = photonIsect.n;
+                                n = Faceforward(n, -photonRay.d);
+                                localRadiancePhotons.push_back(RadiancePhoton(photonIsect.p, n));
+
+                                constexpr int sqrtSamples = 6;
+                                constexpr int nSamples = sqrtSamples * sqrtSamples;
+                                auto s1 = GetSamples2D<nSamples>(*localSampler);
+                                auto s2 = GetSamples2D<nSamples>(*localSampler);
+                                Spectrum rho_r = photonBSDF->rho(nSamples, s1.data(), s2.data(),
+                                                                 BxDFType(BSDF_ALL_TYPES | BSDF_REFLECTION));
+                                localRpReflectances.push_back(rho_r);
+
+                                s1 = GetSamples2D<nSamples>(*localSampler);
+                                s2 = GetSamples2D<nSamples>(*localSampler);
+                                Spectrum rho_t = photonBSDF->rho(nSamples, s1.data(), s2.data(),
+                                                                 BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION));
+                                if (rho_r.HasNaNs() || rho_t.HasNaNs()) {
+                                    int a = 1;
+                                }
+                                localRpTransmittances.push_back(rho_t);
+                            }
+                        }
+                        if (nIntersections >= this->maxPhotonDepth) break;
+
+                        // Sample new photon ray direction
+                        Vector3f wi;
+                        Float pdf;
+                        BxDFType flags;
+                        Point2f uphoton = localSampler->Get2D();
+                        Spectrum fr = photonBSDF->Sample_f(-photonRay.d, &wi, uphoton, &pdfLightPos, BSDF_ALL, &flags);
+                        // TODO wi or -wi?
+                        // TODO wi or -wi?
+                        // TODO wi or -wi?
+                        // TODO wi or -wi?
+                        if (fr.IsBlack() || pdfLightPos == 0.f) break;
+                        Spectrum anew = alpha * fr *
+                                        AbsDot(wi, photonIsect.n) / pdfLightPos;
+
+                        // Possibly terminate photon path with Russian roulette
+                        Float continueProb = std::min(1.f, anew.y() / alpha.y());
+                        if (localSampler->Get1D() > continueProb)
+                            break;
+                        alpha = anew / continueProb;
+                        specularPath &= ((flags & BSDF_SPECULAR) != 0);
+
+                        if (indirectDone && !specularPath) break;
+                        photonRay = photonIsect.SpawnRay(wi);
+                    }
+                }
+                arena.Reset();
+                DCHECK(localSampler->SetSampleNumber(sampleNumber += nTasks));
+            }
+
+            // Merge local photon data with data in _PhotonIntegrator_
+            {
+                MutexLock lock(&mutex);
+
+                // If photons aren't required
+                // => Give up if we're not storing enough photons
+                // NOT guaranteed to ever complete if (requirePhotons == true)
+                if (abortTasks)
+                    return;
+                if (!requirePhotons && nShot > 500000 &&
+                    (unsuccessful(this->nCausticPhotonsWanted,
+                                  causticPhotons.size(), BlockSize) ||
+                     unsuccessful(this->nIndirectPhotonsWanted,
+                                  indirectPhotons.size(), BlockSize))) {
+                    Error("Unable to store enough photons.  Giving up.\n");
+                    causticPhotons.erase(causticPhotons.begin(), causticPhotons.end());
+                    indirectPhotons.erase(indirectPhotons.begin(), indirectPhotons.end());
+                    radiancePhotons.erase(radiancePhotons.begin(), radiancePhotons.end());
+                    abortTasks = true;
+                    return;
+                }
+                progress.Update(localIndirectPhotons.size() + localCausticPhotons.size());
+                nShot += BlockSize;
+
+                // Merge indirect photons into shared array
+                if (!indirectDone) {
+                    this->nIndirectPaths += BlockSize;
+                    for (uint32_t i = 0; i < localIndirectPhotons.size(); ++i)
+                        indirectPhotons.push_back(localIndirectPhotons[i]);
+                    localIndirectPhotons.erase(localIndirectPhotons.begin(),
+                                               localIndirectPhotons.end());
+                    if (indirectPhotons.size() >= this->nIndirectPhotonsWanted)
+                        indirectDone = true;
+                    nDirectPaths += BlockSize;
+                    for (uint32_t i = 0; i < localDirectPhotons.size(); ++i)
+                        directPhotons.push_back(localDirectPhotons[i]);
+                    localDirectPhotons.erase(localDirectPhotons.begin(),
+                                             localDirectPhotons.end());
+                }
+
+                // Merge direct, caustic, and radiance photons into shared array
+                if (!causticDone) {
+                    this->nCausticPaths += BlockSize;
+                    for (uint32_t i = 0; i < localCausticPhotons.size(); ++i)
+                        causticPhotons.push_back(localCausticPhotons[i]);
+                    localCausticPhotons.erase(localCausticPhotons.begin(), localCausticPhotons.end());
+                    if (causticPhotons.size() >= this->nCausticPhotonsWanted)
+                        causticDone = true;
+                }
+
+                for (uint32_t i = 0; i < localRadiancePhotons.size(); ++i)
+                    radiancePhotons.push_back(localRadiancePhotons[i]);
+                localRadiancePhotons.erase(localRadiancePhotons.begin(), localRadiancePhotons.end());
+                for (uint32_t i = 0; i < localRpReflectances.size(); ++i)
+                    rpReflectances.push_back(localRpReflectances[i]);
+                localRpReflectances.erase(localRpReflectances.begin(), localRpReflectances.end());
+                for (uint32_t i = 0; i < localRpTransmittances.size(); ++i)
+                    rpTransmittances.push_back(localRpTransmittances[i]);
+                localRpTransmittances.erase(localRpTransmittances.begin(), localRpTransmittances.end());
+            }
+
+            // Exit task if enough photons have been found
+            if (indirectDone && causticDone)
+                break;
+        }
+
+    }, nTasks);
+    progress.Done();
+}
+
+
+KdTree<Photon> *
+PhotonIntegrator::BuildPhotonMaps(std::vector<Photon> const &directPhotons,
+                                  std::vector<Photon> const &causticPhotons,
+                                  std::vector<Photon> const &indirectPhotons) {
+    if (causticPhotons.size() > 0)
+        causticMap = new KdTree<Photon>(causticPhotons);
+    if (indirectPhotons.size() > 0)
+        indirectMap = new KdTree<Photon>(indirectPhotons);
+
+    KdTree<Photon> *directMap = nullptr;
+    if (directPhotons.size() > 0)
+        directMap = new KdTree<Photon>(directPhotons);
+    return directMap;
+}
+
+
+void PhotonIntegrator::ComputePhotonRadiances(std::vector<RadiancePhoton> &radiancePhotons,
+                                              std::vector<Spectrum> const& rpReflectances,
+                                              std::vector<Spectrum> const& rpTransmittances,
+                                              KdTree<Photon> const* directMap,
+                                              int const nDirectPaths,
+                                              int nTasks,
+                                              ProgressReporter &progress) {
+    ProgressReporter progRadiance(nTasks, "Computing photon radiances");
+    ParallelFor([&](uint32_t i_task) {
+        // Compute range of radiance photons to process in task
+        uint32_t taskSize = radiancePhotons.size() / nTasks;
+        uint32_t excess = radiancePhotons.size() % nTasks;
+        uint32_t rpStart = std::min(i_task, excess) * (taskSize + 1) +
+                           std::max(0, (int) i_task - (int) excess) * taskSize;
+        uint32_t rpEnd = rpStart + taskSize + (i_task < excess ? 1 : 0);
+        if (i_task == nTasks - 1) DCHECK_EQ(rpEnd, radiancePhotons.size());
+        ClosePhoton *lookupBuf = new ClosePhoton[nLookup];
+        for (uint32_t i = rpStart; i < rpEnd; ++i) {
+            // Compute radiance for radiance photon _i_
+            RadiancePhoton &rp = radiancePhotons[i];
+            const Spectrum &rho_r = rpReflectances[i], &rho_t = rpTransmittances[i];
+            if (!rho_r.IsBlack()) {
+                // Accumulate outgoing radiance due to reflected irradiance
+                Spectrum E = EPhoton(directMap, nDirectPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, rp.n) +
+                             EPhoton(indirectMap, nIndirectPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, rp.n) +
+                             EPhoton(causticMap, nCausticPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, rp.n);
+                rp.Lo += InvPi * rho_r * E;
+            }
+            if (!rho_t.IsBlack()) {
+                // Accumulate outgoing radiance due to transmitted irradiance
+                Spectrum E = EPhoton(directMap, nDirectPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, -rp.n) +
+                             EPhoton(indirectMap, nIndirectPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, -rp.n) +
+                             EPhoton(causticMap, nCausticPaths, nLookup, lookupBuf,
+                                     maxDistSquared, rp.p, -rp.n);
+                rp.Lo += InvPi * rho_t * E;
+            }
+        }
+        delete[] lookupBuf;
+        progress.Update();
+    }, 64, 1);
+    progRadiance.Done();
+    radianceMap = new KdTree<RadiancePhoton>(radiancePhotons);
 }
 
 

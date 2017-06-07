@@ -72,8 +72,31 @@ public:
     void Preprocess(const Scene &scene, Sampler &sampler);
 
 private:
+    void ComputeLightSamples(Scene const& scene, Sampler &sampler);
+
+    void ComputeLightPhotonDistrib(Scene const& scene);
+
+    void ShootPhotons(Scene const& scene,
+                      std::vector<Photon> &causticPhotons,
+                      std::vector<Photon> &directPhotons,
+                      std::vector<Photon> &indirectPhotons,
+                      std::vector<RadiancePhoton> &radiancePhotons,
+                      std::vector<Spectrum> &rpReflectances, std::vector<Spectrum> &rpTransmittances,
+                      int &nDirectPaths, uint32_t &nShot, int &nTasks,
+                      ProgressReporter &progress);
+
+    KdTree<Photon> *BuildPhotonMaps(std::vector<Photon> const& directPhotons,
+                                    std::vector<Photon> const& causticPhotons,
+                                    std::vector<Photon> const& indirectPhotons);
+
     // PhotonIntegrator Private Methods
-    friend class PhotonShootingTask;
+    void ComputePhotonRadiances(std::vector<RadiancePhoton> &radiancePhotons,
+                                std::vector<Spectrum> const& rpReflectances,
+                                std::vector<Spectrum> const& rpTransmittances,
+                                KdTree<Photon> const* directMap,
+                                int nDirectPaths,
+                                int nTasks,
+                                ProgressReporter &progress);
 
     // PhotonIntegrator Private Data
     uint32_t nCausticPhotonsWanted, nIndirectPhotonsWanted, nLookup;
