@@ -86,6 +86,7 @@ private:
     std::unique_ptr<Distribution1D> lightDistr;
 
     // Declare sample parameters for light source sampling
+    std::vector<int> nLightSamples;
     int nCausticPaths, nIndirectPaths;
     KdTree<Photon> *causticMap;
     KdTree<Photon> *indirectMap;
@@ -93,7 +94,7 @@ private:
 };
 
 
-PhotonIntegrator *CreatePhotonMapSurfaceIntegrator(
+PhotonIntegrator *CreatePhotonMapIntegrator(
         const ParamSet &params, std::shared_ptr<Sampler> sampler,
         std::shared_ptr<const Camera> camera);
 
