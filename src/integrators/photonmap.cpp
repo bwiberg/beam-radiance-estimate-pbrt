@@ -284,7 +284,6 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
     // Declare shared variables for photon shooting
     int nDirectPaths = 0;
     uint32_t nshot = 0;
-    int nTasks = 0;
     std::vector<Photon> causticPhotons, directPhotons, indirectPhotons;
     std::vector<RadiancePhoton> radiancePhotons;
     causticPhotons.reserve(nCausticPhotonsWanted);
@@ -295,7 +294,7 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
     ShootPhotons(scene,
                  causticPhotons, directPhotons, indirectPhotons, radiancePhotons,
                  rpReflectances, rpTransmittances,
-                 nDirectPaths, nshot, nTasks,
+                 nDirectPaths, nshot,
                  progress);
 
     KdTree<Photon> *directMap = BuildPhotonMaps(directPhotons, causticPhotons, indirectPhotons);
@@ -304,7 +303,7 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
         ComputePhotonRadiances(radiancePhotons,
                                rpReflectances, rpTransmittances,
                                directMap,
-                               nDirectPaths, nTasks,
+                               nDirectPaths,
                                progress);
     }
 
@@ -542,10 +541,10 @@ PhotonIntegrator::ShootPhotons(Scene const& scene,
                                std::vector<Photon> &indirectPhotons,
                                std::vector<RadiancePhoton> &radiancePhotons,
                                std::vector<Spectrum> &rpReflectances, std::vector<Spectrum> &rpTransmittances,
-                               int &nDirectPaths, uint32_t &nShot, int &nTasks,
+                               int &nDirectPaths, uint32_t &nShot,
                                ProgressReporter &progress) {
     Mutex mutex;
-    nTasks = NumSystemCores();
+    int const nTasks = NumSystemCores();
     bool abortTasks = false;
 
     // Create HaltonSampler for generating photons
@@ -669,7 +668,12 @@ PhotonIntegrator::ShootPhotons(Scene const& scene,
                                 Spectrum rho_t = photonBSDF->rho(nSamples, s1.data(), s2.data(),
                                                                  BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION));
                                 if (rho_r.HasNaNs() || rho_t.HasNaNs()) {
-                                    int a = 1;
+                                    // TODO investigate this!
+                                    // TODO investigate this!
+                                    // TODO investigate this!
+                                    // TODO investigate this!
+                                    // TODO investigate this!
+                                    LOG(FATAL) << "rho_r or rho_t has NaNs :/";
                                 }
                                 localRpTransmittances.push_back(rho_t);
                             }
@@ -797,8 +801,8 @@ void PhotonIntegrator::ComputePhotonRadiances(std::vector<RadiancePhoton> &radia
                                               std::vector<Spectrum> const& rpTransmittances,
                                               KdTree<Photon> const* directMap,
                                               int const nDirectPaths,
-                                              int nTasks,
                                               ProgressReporter &progress) {
+    constexpr int nTasks = 64;
     ProgressReporter progRadiance(nTasks, "Computing photon radiances");
     ParallelFor([&](uint32_t i_task) {
         // Compute range of radiance photons to process in task
@@ -810,6 +814,8 @@ void PhotonIntegrator::ComputePhotonRadiances(std::vector<RadiancePhoton> &radia
         if (i_task == nTasks - 1) DCHECK_EQ(rpEnd, radiancePhotons.size());
         ClosePhoton *lookupBuf = new ClosePhoton[nLookup];
         for (uint32_t i = rpStart; i < rpEnd; ++i) {
+            DCHECK(i < rpReflectances.size());
+
             // Compute radiance for radiance photon _i_
             RadiancePhoton &rp = radiancePhotons[i];
             const Spectrum &rho_r = rpReflectances[i], &rho_t = rpTransmittances[i];
@@ -836,7 +842,7 @@ void PhotonIntegrator::ComputePhotonRadiances(std::vector<RadiancePhoton> &radia
         }
         delete[] lookupBuf;
         progress.Update();
-    }, 64, 1);
+    }, nTasks, 1);
     progRadiance.Done();
     radianceMap = new KdTree<RadiancePhoton>(radiancePhotons);
 }

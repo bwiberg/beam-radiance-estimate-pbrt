@@ -82,7 +82,7 @@ private:
                       std::vector<Photon> &indirectPhotons,
                       std::vector<RadiancePhoton> &radiancePhotons,
                       std::vector<Spectrum> &rpReflectances, std::vector<Spectrum> &rpTransmittances,
-                      int &nDirectPaths, uint32_t &nShot, int &nTasks,
+                      int &nDirectPaths, uint32_t &nShot,
                       ProgressReporter &progress);
 
     KdTree<Photon> *BuildPhotonMaps(std::vector<Photon> const& directPhotons,
@@ -95,7 +95,6 @@ private:
                                 std::vector<Spectrum> const& rpTransmittances,
                                 KdTree<Photon> const* directMap,
                                 int nDirectPaths,
-                                int nTasks,
                                 ProgressReporter &progress);
 
     // PhotonIntegrator Private Data
