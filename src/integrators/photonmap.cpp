@@ -247,13 +247,14 @@ Spectrum EPhoton(KdTree<Photon> *map, int count, int nLookup,
 PhotonIntegrator::PhotonIntegrator(std::shared_ptr<const Camera> camera,
                                    std::shared_ptr<Sampler> sampler,
                                    const Bounds2i &pixelBounds,
-                                   int ncaus, int nind,
+                                   int ncaus, int nind, bool reqphotons,
                                    int nl, int mdepth, int mphodepth, float mdist, bool fg,
                                    int gs, float ga) :
         SamplerIntegrator(camera, sampler, pixelBounds),
         nCausticPhotonsWanted(ncaus),
         nIndirectPhotonsWanted(nind),
         nLookup(nl),
+        requirePhotons(reqphotons),
         maxSpecularDepth(mdepth),
         maxPhotonDepth(mphodepth),
         maxDistSquared(mdist * mdist),
@@ -436,6 +437,9 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
                                 s2 = GetSamples2D<nSamples>(*localSampler);
                                 Spectrum rho_t = photonBSDF->rho(nSamples, s1.data(), s2.data(),
                                                                  BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION));
+                                if (rho_r.HasNaNs() || rho_t.HasNaNs()) {
+                                    int a = 1;
+                                }
                                 localRpTransmittances.push_back(rho_t);
                             }
                         }
@@ -474,10 +478,12 @@ void PhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
             {
                 MutexLock lock(&mutex);
 
-                // Give up if we're not storing enough photons
+                // If photons aren't required
+                // => Give up if we're not storing enough photons
+                // NOT guaranteed to ever complete if (requirePhotons == true)
                 if (abortTasks)
                     return;
-                if (nshot > 500000 &&
+                if (!requirePhotons && nshot > 500000 &&
                     (unsuccessful(this->nCausticPhotonsWanted,
                                   causticPhotons.size(), BlockSize) ||
                      unsuccessful(this->nIndirectPhotonsWanted,
@@ -794,6 +800,7 @@ PhotonIntegrator *CreatePhotonMapIntegrator(
         const ParamSet &params, std::shared_ptr<Sampler> sampler,
         std::shared_ptr<const Camera> camera) {
     // TODO from pbrt-v2 PhotonIntegrator
+    bool requirePhotons = params.FindOneBool("requirephotons", false);
     int nCaustic = params.FindOneInt("causticphotons", 20000);
     int nIndirect = params.FindOneInt("indirectphotons", 100000);
     int nUsed = params.FindOneInt("nused", 50);
@@ -827,7 +834,7 @@ PhotonIntegrator *CreatePhotonMapIntegrator(
     }
 
     return new PhotonIntegrator(camera, sampler, pixelBounds,
-                                nCaustic, nIndirect,
+                                nCaustic, nIndirect, requirePhotons,
                                 nUsed, maxSpecularDepth, maxPhotonDepth, maxDist, finalGather, gatherSamples,
                                 gatherAngle);
 }

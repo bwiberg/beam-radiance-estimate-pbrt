@@ -56,7 +56,8 @@ public:
     PhotonIntegrator(std::shared_ptr<const Camera> camera,
                      std::shared_ptr<Sampler> sampler,
                      const Bounds2i &pixelBounds,
-                     int ncaus, int nindir, int nLookup, int maxspecdepth,
+                     int ncaus, int nindir, bool reqphotons,
+                     int nLookup, int maxspecdepth,
                      int maxphotondepth, float maxdist, bool finalGather, int gatherSamples,
                      float ga);
 
@@ -76,6 +77,7 @@ private:
 
     // PhotonIntegrator Private Data
     uint32_t nCausticPhotonsWanted, nIndirectPhotonsWanted, nLookup;
+    bool requirePhotons;
     Float maxDistSquared;
     int maxSpecularDepth, maxPhotonDepth;
     bool finalGather;
