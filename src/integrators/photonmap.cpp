@@ -574,6 +574,10 @@ PhotonIntegrator::ShootPhotons(Scene const& scene,
             // Follow photon paths for a block of samples
             constexpr uint32_t BlockSize = 4096;
             for (uint32_t i = 0; i < BlockSize; ++i) {
+                bool valid = localSampler->SetSampleNumber(sampleNumber);
+                sampleNumber += nTasks;
+                DCHECK(valid);
+
                 Float const u0 = localSampler->Get1D();
                 Point2f const &u12 = localSampler->Get2D();
                 Point2f const &u34 = localSampler->Get2D();
@@ -706,7 +710,6 @@ PhotonIntegrator::ShootPhotons(Scene const& scene,
                     }
                 }
                 arena.Reset();
-                DCHECK(localSampler->SetSampleNumber(sampleNumber += nTasks));
             }
 
             // Merge local photon data with data in _PhotonIntegrator_
