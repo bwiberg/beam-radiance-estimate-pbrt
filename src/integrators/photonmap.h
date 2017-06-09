@@ -56,7 +56,7 @@ public:
     PhotonIntegrator(std::shared_ptr<const Camera> camera,
                      std::shared_ptr<Sampler> sampler,
                      const Bounds2i &pixelBounds,
-                     int ncaus, int nindir, bool reqphotons,
+                     int ncaus, int nindir, int nvolume, bool reqphotons,
                      int nLookup, int maxspecdepth,
                      int maxphotondepth, float maxdist, bool finalGather, int gatherSamples,
                      float ga);
@@ -80,13 +80,15 @@ private:
                       std::vector<Photon> &causticPhotons,
                       std::vector<Photon> &directPhotons,
                       std::vector<Photon> &indirectPhotons,
+                      std::vector<Photon> &volumePhotons,
                       std::vector<RadiancePhoton> &radiancePhotons,
                       std::vector<Spectrum> &rpReflectances, std::vector<Spectrum> &rpTransmittances,
                       int &nDirectPaths, uint32_t &nShot);
 
-    KdTree<Photon> *BuildPhotonMaps(std::vector<Photon> const& directPhotons,
-                                    std::vector<Photon> const& causticPhotons,
-                                    std::vector<Photon> const& indirectPhotons);
+    void BuildPhotonMaps(std::vector<Photon> const& directPhotons,
+                         std::vector<Photon> const& causticPhotons,
+                         std::vector<Photon> const& indirectPhotons,
+                         std::vector<Photon> const& volumePhotons);
 
     // PhotonIntegrator Private Methods
     void ComputePhotonRadiances(std::vector<RadiancePhoton> &radiancePhotons,
@@ -96,7 +98,7 @@ private:
                                 int nDirectPaths);
 
     // PhotonIntegrator Private Data
-    uint32_t nCausticPhotonsWanted, nIndirectPhotonsWanted, nLookup;
+    uint32_t nCausticPhotonsWanted, nIndirectPhotonsWanted, nVolumePhotonsWanted, nLookup;
     bool requirePhotons;
     Float maxDistSquared;
     int maxSpecularDepth, maxPhotonDepth;
@@ -110,6 +112,7 @@ private:
     // Declare sample parameters for light source sampling
     std::vector<int> nLightSamples;
     int nCausticPaths, nIndirectPaths;
+    KdTree<Photon> *directMap;
     KdTree<Photon> *causticMap;
     KdTree<Photon> *indirectMap;
     KdTree<Photon> *volumeMap;
