@@ -52,7 +52,7 @@ class HomogeneousMedium : public Medium {
           sigma_s(sigma_s),
           sigma_t(sigma_s + sigma_a),
           g(g) {}
-    Spectrum Tr(const Ray &ray, Sampler &sampler) const;
+    Spectrum Tr(const Ray &ray, Sampler &sampler, int32_t *nSamplesUsed = nullptr) const;
     Spectrum Sample(const Ray &ray, Sampler &sampler, MemoryArena &arena,
                     MediumInteraction *mi) const;
 

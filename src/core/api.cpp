@@ -60,6 +60,7 @@
 #include "integrators/sppm.h"
 #include "integrators/volpath.h"
 #include "integrators/photonmap.h"
+#include "integrators/volphotonmap.h"
 #include "integrators/whitted.h"
 #include "lights/diffuse.h"
 #include "lights/distant.h"
@@ -1449,21 +1450,23 @@ Integrator *RenderOptions::MakeIntegrator() const {
         integrator = CreateVolPathIntegrator(IntegratorParams, sampler, camera);
     else if (IntegratorName == "photonmap")
         integrator = CreatePhotonMapIntegrator(IntegratorParams, sampler, camera);
-    else if (IntegratorName == "bdpt") {
+    else if (IntegratorName == "volphotonmap")
+        integrator = CreateVolPhotonMapIntegrator(IntegratorParams, sampler, camera);
+    else if (IntegratorName == "bdpt")
         integrator = CreateBDPTIntegrator(IntegratorParams, sampler, camera);
-    } else if (IntegratorName == "mlt") {
+    else if (IntegratorName == "mlt")
         integrator = CreateMLTIntegrator(IntegratorParams, camera);
-    } else if (IntegratorName == "ambientocclusion") {
+    else if (IntegratorName == "ambientocclusion")
         integrator = CreateAOIntegrator(IntegratorParams, sampler, camera);
-    } else if (IntegratorName == "sppm") {
+    else if (IntegratorName == "sppm")
         integrator = CreateSPPMIntegrator(IntegratorParams, camera);
-    } else {
+    else {
         Error("Integrator \"%s\" unknown.", IntegratorName.c_str());
         return nullptr;
     }
 
     if (renderOptions->haveScatteringMedia && IntegratorName != "volpath" &&
-        IntegratorName != "bdpt" && IntegratorName != "mlt") {
+        IntegratorName != "bdpt" && IntegratorName != "mlt" && IntegratorName != "volphotonmap") {
         Warning(
             "Scene has scattering media but \"%s\" integrator doesn't support "
             "volume scattering. Consider using \"volpath\", \"bdpt\", or "

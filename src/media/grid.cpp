@@ -86,7 +86,7 @@ Spectrum GridDensityMedium::Sample(const Ray &rWorld, Sampler &sampler,
     return Spectrum(1.f);
 }
 
-Spectrum GridDensityMedium::Tr(const Ray &rWorld, Sampler &sampler) const {
+Spectrum GridDensityMedium::Tr(const Ray &rWorld, Sampler &sampler, int32_t *nSamplesUsed) const {
     ProfilePhase _(Prof::MediumTr);
     ++nTrCalls;
 
@@ -102,6 +102,7 @@ Spectrum GridDensityMedium::Tr(const Ray &rWorld, Sampler &sampler) const {
     while (true) {
         ++nTrSteps;
         t -= std::log(1 - sampler.Get1D()) * invMaxDensity / sigma_t;
+        if (nSamplesUsed) ++nSamplesUsed;
         if (t >= tMax) break;
         Float density = Density(ray(t));
         Tr *= 1 - std::max((Float)0, density * invMaxDensity);
@@ -110,6 +111,7 @@ Spectrum GridDensityMedium::Tr(const Ray &rWorld, Sampler &sampler) const {
         const Float rrThreshold = .1;
         if (Tr < rrThreshold) {
             Float q = std::max((Float).05, 1 - Tr);
+            if (nSamplesUsed) ++nSamplesUsed;
             if (sampler.Get1D() < q) return 0;
             Tr /= 1 - q;
         }

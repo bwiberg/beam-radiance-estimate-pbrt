@@ -41,7 +41,8 @@
 namespace pbrt {
 
 // HomogeneousMedium Method Definitions
-Spectrum HomogeneousMedium::Tr(const Ray &ray, Sampler &sampler) const {
+Spectrum HomogeneousMedium::Tr(const Ray &ray, Sampler &sampler, int32_t *nSamplesUsed) const {
+    if (nSamplesUsed) nSamplesUsed = 0;
     ProfilePhase _(Prof::MediumTr);
     return Exp(-sigma_t * std::min(ray.tMax * ray.d.Length(), MaxFloat));
 }

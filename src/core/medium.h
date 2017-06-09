@@ -76,7 +76,7 @@ class Medium {
   public:
     // Medium Interface
     virtual ~Medium() {}
-    virtual Spectrum Tr(const Ray &ray, Sampler &sampler) const = 0;
+    virtual Spectrum Tr(const Ray &ray, Sampler &sampler, int32_t *nSamplesUsed = nullptr) const = 0;
     virtual Spectrum Sample(const Ray &ray, Sampler &sampler,
                             MemoryArena &arena,
                             MediumInteraction *mi) const = 0;
