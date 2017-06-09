@@ -21,12 +21,6 @@ STAT_COUNTER("Photon Mapping/Total radiance photons", radiancePhotonCounter);
 STAT_COUNTER("Photon Mapping/Total volume photons", volumePhotonCounter);
 STAT_MEMORY_COUNTER("Memory/Photon maps", photonMapBytes);
 
-template<size_t N>
-std::array<Float, N> GetSamples1D(Sampler &sampler);
-
-template<size_t N>
-std::array<Point2f, N> GetSamples2D(Sampler &sampler);
-
 struct Photon {
     Photon(const Point3f &pp, const Spectrum &wt, const Vector3f &w)
             : p(pp), alpha(wt), wi(w) {}
@@ -215,7 +209,26 @@ Spectrum VolPhotonIntegrator::Li(const RayDifferential &ray,
                                  Sampler &sampler,
                                  MemoryArena &arena,
                                  int depth) const {
-    return Spectrum(0.0f);
+    Spectrum L(0.0f);
+
+    // Find closest ray intersection or return background radiance
+    SurfaceInteraction isect;
+    if (!scene.Intersect(ray, &isect)) {
+        for (const auto &light : scene.lights) L += light->Le(ray);
+        return L;
+    }
+
+    const Point3f p = isect.p;
+
+    const uint32_t nIndirSamplePhotons = 50;
+    PhotonProcess proc(nIndirSamplePhotons,
+                       arena.Alloc<ClosePhoton>(nIndirSamplePhotons));
+    Float md2 = maxDistSquared;
+    indirectMap->Lookup(p, proc, md2);
+    if (proc.nFound > 0)
+        L = Spectrum(1.0f);
+
+    return L;
 }
 
 
@@ -265,7 +278,7 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
     uint32_t totalPhotonsSent = 0;
 
     ParallelFor([&](const int64_t TaskIndex) {
-        MemoryArena arena;
+        MemoryArena arena(4096);
 
         constexpr uint32_t BatchSize = 4096;
         std::vector<Photon> localDirectPhotons, localIndirectPhotons, localCausticPhotons, localVolumePhotons;
@@ -277,7 +290,8 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
         bool causticDone = nCausticPhotonsWanted == 0;
         bool volumeDone = nVolumePhotonsWanted == 0;
 
-        auto sampler = samplerBase.Clone(TaskIndex);
+        auto badsampler = samplerBase.Clone(TaskIndex);
+        HaltonSampler* sampler = static_cast<HaltonSampler*>(badsampler.get());
         sampler->StartPixel(Point2i());
 
         // Shoot photons until required number of photons stored
@@ -293,28 +307,36 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
                 const uint32_t PhotonIndex = LocalPhotonStartIndex + i;
                 RNG rng(PhotonIndex);
                 uint32_t rngdim = 0;
+                sampler->StartPixel(Point2i());
+                sampler->SetSampleNumber(PhotonIndex);
 
                 auto Get2D = [&]() {
                     if (rngdim + 1 <= 1000) {
-                        return Point2f(RadicalInverse(rngdim++, PhotonIndex),
-                                       RadicalInverse(rngdim++, PhotonIndex));
+                        rngdim += 2;
+                        return sampler->Get2D();
+//                        const uint32_t dim0 = rngdim++;
+//                        return Point2f(RadicalInverse(dim0, PhotonIndex),
+//                                       RadicalInverse(rngdim++, PhotonIndex));
                     }
                     return Point2f(rng.UniformFloat(), rng.UniformFloat());
                 };
 
                 auto Get1D = [&]() {
-                    if (rngdim < 1000) return RadicalInverse(rngdim++, PhotonIndex);
+                    if (rngdim < 1000) {
+//                        return RadicalInverse(rngdim++, PhotonIndex);
+                        rngdim++;
+                        return sampler->Get1D();
+                    }
                     return rng.UniformFloat();
                 };
 
                 auto Get2Ds = [&](const int32_t NumValues) {
-                    Point2f *values = new Point2f[NumValues];
+                    Point2f *values = arena.Alloc<Point2f>(NumValues, false);
                     for (int32_t i = 0; i < NumValues; ++i)
                         values[i] = Get2D();
                     return values;
                 };
 
-                sampler->SetSampleNumber(PhotonIndex);
 
                 // Choose light to shoot photon from
                 Float lightPdf;
@@ -356,7 +378,7 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
                     // Handle photon/surface interaction
                     photonIsect.ComputeScatteringFunctions(photonRay, arena);
                     BSDF *bsdf = photonIsect.bsdf;
-                    DCHECK(bsdf != nullptr); // bsdf should never be nullptr here
+                    if (!bsdf) break;
                     constexpr BxDFType SpecularBxDFType = BxDFType(BSDF_REFLECTION |
                                                                    BSDF_TRANSMISSION |
                                                                    BSDF_SPECULAR);
@@ -513,6 +535,7 @@ void VolPhotonIntegrator::BuildPhotonMaps(std::vector<Photon> const &directPhoto
                                           std::vector<Photon> const &indirectPhotons,
                                           std::vector<Photon> const &causticPhotons,
                                           std::vector<Photon> const &volumePhotons) {
+    ProgressReporter progress(3, "Building photon maps");
     ParallelFor([&](int64_t TaskIndex) {
         DCHECK_GE(TaskIndex, 0);
         DCHECK_LE(TaskIndex, 3);
@@ -525,7 +548,10 @@ void VolPhotonIntegrator::BuildPhotonMaps(std::vector<Photon> const &directPhoto
             causticMap = new KdTree<Photon>(causticPhotons);
         else if (TaskIndex == 3 && volumePhotons.size() > 0)
             volumeMap = new KdTree<Photon>(volumePhotons);
+
+        progress.Update(1);
     }, 4);
+    progress.Done();
 }
 
 
@@ -581,20 +607,4 @@ VolPhotonIntegrator *CreateVolPhotonMapIntegrator(
                                    maxDist, finalGather, gatherSamples,
                                    gatherAngle);
 }
-
-template<size_t N>
-std::array<Float, N> GetSamples1D(Sampler &sampler) {
-    std::array<Float, N> values;
-    for (int i = 0; i < N; ++i)
-        values[i] = sampler.Get1D();
-    return values;
-};
-
-template<size_t N>
-std::array<Point2f, N> GetSamples2D(Sampler &sampler) {
-    std::array<Point2f, N> values;
-    for (int i = 0; i < N; ++i)
-        values[i] = sampler.Get2D();
-    return values;
-};
 }

@@ -70,6 +70,8 @@ public:
                 MemoryArena &arena,
                 int depth = 0) const;
 
+
+
     void Preprocess(const Scene &scene, Sampler &sampler);
 
 private:
