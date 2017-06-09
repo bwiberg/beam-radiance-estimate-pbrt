@@ -14,6 +14,7 @@
 
 namespace pbrt {
 STAT_COUNTER("Photon Mapping/Total Photon Surface Interactions ", totalPhotonSurfaceInteractions);
+STAT_COUNTER("Photon Mapping/Total Photon Volume Interactions ", totalPhotonVolumeInteractions);
 STAT_COUNTER("Photon Mapping/Photon paths followed", photonPaths);
 STAT_COUNTER("Photon Mapping/Total indirect photons", indirectPhotonCounter);
 STAT_COUNTER("Photon Mapping/Total caustic photons", causticPhotonCounter);
@@ -200,7 +201,7 @@ void VolPhotonIntegrator::Preprocess(const Scene &scene, Sampler &sampler) {
                  directPhotons, indirectPhotons, causticPhotons, volumePhotons,
                  radiancePhotons, radpReflectances, radpTransmittances,
                  nDirectPaths, nShot);
-
+    BuildPhotonMaps(directPhotons, indirectPhotons, causticPhotons, volumePhotons);
 }
 
 
@@ -258,6 +259,28 @@ void VolPhotonIntegrator::ComputeLightPhotonDistrib(Scene const &scene) {
 }
 
 
+class UniformRandomSampler : public Sampler {
+public:
+    UniformRandomSampler(int64_t samplesPerPixel, RNG &rng)
+            : Sampler(samplesPerPixel), rng(rng) {}
+
+    Float Get1D() override {
+        return rng.UniformFloat();
+    }
+
+    Point2f Get2D() override {
+        return Point2f(rng.UniformFloat(), rng.UniformFloat());
+    }
+
+    std::unique_ptr<Sampler> Clone(int seed) override {
+        return nullptr;
+    }
+
+private:
+    RNG &rng;
+};
+
+
 void
 VolPhotonIntegrator::ShootPhotons(Scene const &scene,
                                   std::vector<Photon> &directPhotons,
@@ -274,7 +297,6 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
     const int NumTasks = NumSystemCores();
     Mutex mutex;
 
-    HaltonSampler samplerBase(std::numeric_limits<int>::max(), Bounds2i(Point2i(), Point2i()));
     uint32_t totalPhotonsSent = 0;
 
     ParallelFor([&](const int64_t TaskIndex) {
@@ -290,10 +312,6 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
         bool causticDone = nCausticPhotonsWanted == 0;
         bool volumeDone = nVolumePhotonsWanted == 0;
 
-        auto badsampler = samplerBase.Clone(TaskIndex);
-        HaltonSampler* sampler = static_cast<HaltonSampler*>(badsampler.get());
-        sampler->StartPixel(Point2i());
-
         // Shoot photons until required number of photons stored
         while (true) {
             uint32_t LocalPhotonStartIndex;
@@ -306,30 +324,22 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
             for (uint32_t i = 0; i < BatchSize; ++i) {
                 const uint32_t PhotonIndex = LocalPhotonStartIndex + i;
                 RNG rng(PhotonIndex);
-                uint32_t rngdim = 0;
-                sampler->StartPixel(Point2i());
-                sampler->SetSampleNumber(PhotonIndex);
-
+                UniformRandomSampler URS(0, rng);
+                uint32_t haltonDim = 0;
                 auto Get2D = [&]() {
-                    if (rngdim + 1 <= 1000) {
-                        rngdim += 2;
-                        return sampler->Get2D();
-//                        const uint32_t dim0 = rngdim++;
-//                        return Point2f(RadicalInverse(dim0, PhotonIndex),
-//                                       RadicalInverse(rngdim++, PhotonIndex));
+                    if (haltonDim + 1 <= 1000) {
+                        const uint32_t dim0 = haltonDim++;
+                        return Point2f(RadicalInverse(dim0, PhotonIndex),
+                                       RadicalInverse(haltonDim++, PhotonIndex));
                     }
                     return Point2f(rng.UniformFloat(), rng.UniformFloat());
                 };
-
                 auto Get1D = [&]() {
-                    if (rngdim < 1000) {
-//                        return RadicalInverse(rngdim++, PhotonIndex);
-                        rngdim++;
-                        return sampler->Get1D();
+                    if (haltonDim < 1000) {
+                        return RadicalInverse(haltonDim++, PhotonIndex);
                     }
                     return rng.UniformFloat();
                 };
-
                 auto Get2Ds = [&](const int32_t NumValues) {
                     Point2f *values = arena.Alloc<Point2f>(NumValues, false);
                     for (int32_t i = 0; i < NumValues; ++i)
@@ -362,71 +372,82 @@ VolPhotonIntegrator::ShootPhotons(Scene const &scene,
                 uint32_t nIntersections = 0;
                 while (scene.Intersect(photonRay, &photonIsect)) {
                     ++nIntersections;
-                    ++totalPhotonSurfaceInteractions;
-                    // Photon reached surface, handle:
-                    // 1. Participating media interactions (scattering or absorption)
-                    // 2. Surface interaction at photonIsect
 
                     // Participating media interactions
-                    // TODO implement
-                    if (photonRay.medium) {
-                        int32_t nsamps = 0;
-                        alpha *= photonRay.medium->Tr(photonRay, *sampler, &nsamps);
-                        rngdim += nsamps;
-                    }
+                    MediumInteraction mi;
+                    if (photonRay.medium) alpha *= photonRay.medium->Sample(photonRay, URS, arena, &mi);
+                    if (alpha.IsBlack()) break;
 
-                    // Handle photon/surface interaction
+                    // Handle photon interaction with medium OR surface
                     photonIsect.ComputeScatteringFunctions(photonRay, arena);
                     BSDF *bsdf = photonIsect.bsdf;
-                    if (!bsdf) break;
-                    constexpr BxDFType SpecularBxDFType = BxDFType(BSDF_REFLECTION |
-                                                                   BSDF_TRANSMISSION |
-                                                                   BSDF_SPECULAR);
-                    const bool HasNonSpecular = bsdf->NumComponents() >
-                                                bsdf->NumComponents(SpecularBxDFType);
+                    if (!bsdf) {
+                        photonRay = photonIsect.SpawnRay(photonRay.d);
+                        nIntersections--;
+                        continue;
+                    }
+
                     Vector3f wo = -photonRay.d;
-                    if (HasNonSpecular) {
-                        // Deposit photon at surface
-                        const Photon photon(photonIsect.p, alpha, wo);
-                        bool hasDepositedPhoton = false;
-                        if (isSpecPath && nIntersections > 1 && !causticDone) {
-                            hasDepositedPhoton = true;
-                            localCausticPhotons.push_back(photon);
-                        } else {
-                            // Deposit either direct or indirect photon
-                            // stop depositing direct photons once indirectDone is true; don't
-                            // want to waste memory storing too many if we're going a long time
-                            // trying to get enough caustic photons desposited.
-                            if (nIntersections == 1 && !indirectDone && finalGather) {
+                    if (mi.IsValid()) {
+                        ++totalPhotonVolumeInteractions;
+
+                        Photon photon(mi.p, alpha, wo);
+                        if (nIntersections > 1 && !volumeDone)
+                            localVolumePhotons.push_back(photon);
+
+                    } else {
+                        ++totalPhotonSurfaceInteractions;
+
+                        // Handle photon/surface interaction
+                        constexpr BxDFType SpecularBxDFType = BxDFType(BSDF_REFLECTION |
+                                                                       BSDF_TRANSMISSION |
+                                                                       BSDF_SPECULAR);
+                        const bool HasNonSpecular = bsdf->NumComponents() >
+                                                    bsdf->NumComponents(SpecularBxDFType);
+                        if (HasNonSpecular) {
+                            // Deposit photon at surface
+                            const Photon photon(photonIsect.p, alpha, wo);
+                            bool hasDepositedPhoton = false;
+                            if (isSpecPath && nIntersections > 1 && !causticDone) {
                                 hasDepositedPhoton = true;
-                                localDirectPhotons.push_back(photon);
-                            } else if (nIntersections > 1 && !indirectDone) {
-                                hasDepositedPhoton = true;
-                                localIndirectPhotons.push_back(photon);
+                                localCausticPhotons.push_back(photon);
+                            } else {
+                                // Deposit either direct or indirect photon
+                                // stop depositing direct photons once indirectDone is true; don't
+                                // want to waste memory storing too many if we're going a long time
+                                // trying to get enough caustic photons desposited.
+                                if (nIntersections == 1 && !indirectDone && finalGather) {
+                                    hasDepositedPhoton = true;
+                                    localDirectPhotons.push_back(photon);
+                                } else if (nIntersections > 1 && !indirectDone) {
+                                    hasDepositedPhoton = true;
+                                    localIndirectPhotons.push_back(photon);
+                                }
+                            }
+
+                            // Possibly create radiance photon at photon intersection point
+                            if (hasDepositedPhoton && finalGather && Get1D() < .125f) {
+                                const Normal3f normal = Faceforward(photonIsect.n, -photonRay.d);
+                                localRadiancePhotons.push_back(RadiancePhoton(photonIsect.p, normal));
+
+                                constexpr int32_t SqrtSamples = 6;
+                                constexpr int32_t NumSamples = SqrtSamples * SqrtSamples;
+
+                                Point2f *s1 = Get2Ds(NumSamples);
+                                Point2f *s2 = Get2Ds(NumSamples);
+                                //std::array<Point2f, NumSamples> s1 = GetSamples2D<NumSamples>(*sampler);
+                                //std::array<Point2f, NumSamples> s2 = GetSamples2D<NumSamples>(*sampler);
+                                constexpr BxDFType ReflectanceBxDFType = BxDFType(BSDF_ALL_TYPES | BSDF_REFLECTION);
+                                localRadpRfls.push_back(bsdf->rho(NumSamples, s1, s2, ReflectanceBxDFType));
+
+                                s1 = Get2Ds(NumSamples);
+                                s2 = Get2Ds(NumSamples);
+                                constexpr BxDFType TransmittanceBxDFType = BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION);
+                                localRadpTrs.push_back(bsdf->rho(NumSamples, s1, s2, TransmittanceBxDFType));
                             }
                         }
-
-                        // Possibly create radiance photon at photon intersection point
-                        if (hasDepositedPhoton && finalGather && Get1D() < .125f) {
-                            const Normal3f normal = Faceforward(photonIsect.n, -photonRay.d);
-                            localRadiancePhotons.push_back(RadiancePhoton(photonIsect.p, normal));
-
-                            constexpr int32_t SqrtSamples = 6;
-                            constexpr int32_t NumSamples = SqrtSamples * SqrtSamples;
-
-                            Point2f *s1 = Get2Ds(NumSamples);
-                            Point2f *s2 = Get2Ds(NumSamples);
-                            //std::array<Point2f, NumSamples> s1 = GetSamples2D<NumSamples>(*sampler);
-                            //std::array<Point2f, NumSamples> s2 = GetSamples2D<NumSamples>(*sampler);
-                            constexpr BxDFType ReflectanceBxDFType = BxDFType(BSDF_ALL_TYPES | BSDF_REFLECTION);
-                            localRadpRfls.push_back(bsdf->rho(NumSamples, s1, s2, ReflectanceBxDFType));
-
-                            s1 = Get2Ds(NumSamples);
-                            s2 = Get2Ds(NumSamples);
-                            constexpr BxDFType TransmittanceBxDFType = BxDFType(BSDF_ALL_TYPES | BSDF_TRANSMISSION);
-                            localRadpTrs.push_back(bsdf->rho(NumSamples, s1, s2, TransmittanceBxDFType));
-                        }
                     }
+
                     if (nIntersections >= maxPhotonDepth) break;
 
                     // Sample new photon ray direction
