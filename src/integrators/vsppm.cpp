@@ -53,6 +53,8 @@ STAT_RATIO(
         visiblePointsChecked, totalPhotonSurfaceInteractions);
 STAT_COUNTER("Stochastic Progressive Photon Mapping/Photon paths followed",
              photonPaths);
+STAT_COUNTER("Stochastic Progressive Photon Mapping/Total photon medium interactions",
+             totalPhotonMediumInteractions);
 STAT_INT_DISTRIBUTION(
         "Stochastic Progressive Photon Mapping/Grid cells per visible point",
         gridCellsPerVisiblePoint);
@@ -70,13 +72,25 @@ struct SPPMPixel {
     struct VisiblePoint {
         // VisiblePoint Public Methods
         VisiblePoint() {}
-        VisiblePoint(const Point3f &p, const Vector3f &wo, const BSDF *bsdf,
+        VisiblePoint(const Point3f &p, const Vector3f &wo,
+                     const BSDF *bsdf, const PhaseFunction *phase,
                      const Spectrum &beta)
-                : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
+                : p(p), wo(wo), bsdf(bsdf), phase(phase), beta(beta) {}
         Point3f p;
         Vector3f wo;
-        const BSDF *bsdf = nullptr;
+        const BSDF *bsdf;
+        const PhaseFunction *phase;
         Spectrum beta;
+
+        bool IsSurfacePoint() {
+            CHECK((bsdf && !phase) || (!bsdf && phase));
+            return bsdf != nullptr;
+        }
+
+        bool IsMediumPoint() {
+            CHECK((bsdf && !phase) || (!bsdf && phase));
+            return phase != nullptr;
+        }
     } vp;
     AtomicFloat Phi[Spectrum::nSamples];
     std::atomic<int> M;
@@ -144,6 +158,32 @@ private:
     size_t sampleCount;
 };
 
+class AwesomeHaltonSampler : public Sampler {
+public:
+    AwesomeHaltonSampler(uint64_t haltonIndex)
+            : Sampler(0), HaltonIndex(haltonIndex), haltonDim(0), rng(HaltonIndex) {}
+
+    Float Get1D() override {
+        if (haltonDim + 1 <= 1000) {
+            return RadicalInverse(haltonDim++, HaltonIndex);
+        }
+        return rng.UniformFloat();
+    }
+
+    Point2f Get2D() override {
+        return Point2f(Get1D(), Get1D());
+    }
+
+    std::unique_ptr<Sampler> Clone(int seed) override {
+        return nullptr;
+    }
+
+private:
+    const uint64_t HaltonIndex;
+    uint32_t haltonDim;
+    RNG rng;
+};
+
 // SPPM Method Definitions
 void VolSPPMIntegrator::Render(const Scene &scene) {
     ProfilePhase p(Prof::IntegratorRender);
@@ -168,7 +208,13 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                    (pixelExtent.y + tileSize - 1) / tileSize);
     ProgressReporter progress(2 * nIterations, "Rendering");
 
+    // Counter to extend HaltonSampler values beyond 1000
+    uint64_t globalNumPixels = 0;
+
     for (int iter = 0; iter < nIterations; ++iter) {
+        // Counter to extend HaltonSampler values beyond 1000
+        uint32_t iterNumPixels = 0;
+
         // Generate VolSPPM visible points
         std::vector<MemoryArena> perThreadArenas(MaxThreadIndex());
         {
@@ -185,15 +231,13 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 int y1 = std::min(y0 + tileSize, pixelBounds.pMax.y);
                 Bounds2i tileBounds(Point2i(x0, y0), Point2i(x1, y1));
 
-                const uint64_t RngOffset = static_cast<uint64_t>(pixelBounds.Area() * iter
-                                                                 + tileBounds.Area() * TileIndex);
-
                 for (Point2i pPixel : tileBounds) {
-                    const uint32_t PixelIndex = static_cast<uint32_t>(pPixel.y * tileBounds.Diagonal().x + pPixel.x);
+                    const uint32_t PixelIndex = iterNumPixels++;
+                    const uint64_t GoodPixelIndex = globalNumPixels + PixelIndex;
                     // Prepare _tileSampler_ for _pPixel_
                     tileSampler->StartPixel(pPixel);
                     tileSampler->SetSampleNumber(iter);
-                    AwesomeSampler localSampler(0, *tileSampler, 1000, RngOffset + PixelIndex);
+                    AwesomeSampler localSampler(0, *tileSampler, 1000, GoodPixelIndex);
 
                     // Generate camera ray for pixel for SPPM
                     CameraSample cameraSample =
@@ -214,7 +258,6 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     bool specularBounce = false;
                     for (int depth = 0; depth < maxDepth; ++depth) {
                         SurfaceInteraction isect;
-                        ++totalPhotonSurfaceInteractions;
                         if (!scene.Intersect(ray, &isect)) {
                             // Accumulate light contributions for ray with no
                             // intersection
@@ -222,56 +265,76 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 pixel.Ld += beta * light->Le(ray);
                             break;
                         }
-                        // Process SPPM camera ray intersection
 
-                        // Compute BSDF at SPPM camera ray intersection
-                        isect.ComputeScatteringFunctions(ray, arena, true);
-                        if (!isect.bsdf) {
-                            ray = isect.SpawnRay(ray.d);
-                            --depth;
-                            continue;
-                        }
-                        const BSDF &bsdf = *isect.bsdf;
+                        MediumInteraction mi;
+                        if (ray.medium) beta *= ray.medium->Sample(ray, localSampler, arena, &mi);
+                        if (beta.IsBlack()) break;
 
-                        // Accumulate direct illumination at SPPM camera ray
-                        // intersection
-                        Vector3f wo = -ray.d;
-                        if (depth == 0 || specularBounce)
-                            pixel.Ld += beta * isect.Le(wo);
-                        pixel.Ld +=
-                                beta * UniformSampleOneLight(isect, scene, arena,
-                                                             localSampler);
+                        // Handle an interaction with a medium or a surface
+                        if (mi.IsValid()) {
+                            ++totalPhotonMediumInteractions;
+                            // Process SPPM camera ray medium interaction
+                            Vector3f wo = -ray.d;
+                            pixel.Ld += beta * UniformSampleOneLight(mi, scene, arena,
+                                                                 localSampler, true);
 
-                        // Possibly create visible point and end camera path
-                        bool isDiffuse = bsdf.NumComponents(BxDFType(
-                                BSDF_DIFFUSE | BSDF_REFLECTION |
-                                BSDF_TRANSMISSION)) > 0;
-                        bool isGlossy = bsdf.NumComponents(BxDFType(
-                                BSDF_GLOSSY | BSDF_REFLECTION |
-                                BSDF_TRANSMISSION)) > 0;
-                        if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
-                            pixel.vp = {isect.p, wo, &bsdf, beta};
+                            // Create visible point and end camera path
+                            pixel.vp = {mi.p, wo, nullptr, mi.phase, beta};
                             break;
-                        }
 
-                        // Spawn ray from SPPM camera path vertex
-                        if (depth < maxDepth - 1) {
-                            Float pdf;
-                            Vector3f wi;
-                            BxDFType type;
-                            Spectrum f =
-                                    bsdf.Sample_f(wo, &wi, localSampler.Get2D(),
-                                                  &pdf, BSDF_ALL, &type);
-                            if (pdf == 0. || f.IsBlack()) break;
-                            specularBounce = (type & BSDF_SPECULAR) != 0;
-                            beta *= f * AbsDot(wi, isect.shading.n) / pdf;
-                            if (beta.y() < 0.25) {
-                                Float continueProb =
-                                        std::min((Float)1, beta.y());
-                                if (localSampler.Get1D() > continueProb) break;
-                                beta /= continueProb;
+                        } else {
+                            ++totalPhotonSurfaceInteractions;
+                            // Process SPPM camera ray surface intersection
+
+                            // Compute BSDF at SPPM camera ray intersection
+                            isect.ComputeScatteringFunctions(ray, arena, true);
+                            if (!isect.bsdf) {
+                                ray = isect.SpawnRay(ray.d);
+                                --depth;
+                                continue;
                             }
-                            ray = (RayDifferential)isect.SpawnRay(wi);
+                            const BSDF &bsdf = *isect.bsdf;
+
+                            // Accumulate direct illumination at SPPM camera ray
+                            // intersection
+                            Vector3f wo = -ray.d;
+                            if (depth == 0 || specularBounce)
+                                pixel.Ld += beta * isect.Le(wo);
+                            pixel.Ld +=
+                                    beta * UniformSampleOneLight(isect, scene, arena,
+                                                                 localSampler, true);
+
+                            // Possibly create visible point and end camera path
+                            bool isDiffuse = bsdf.NumComponents(BxDFType(
+                                    BSDF_DIFFUSE | BSDF_REFLECTION |
+                                    BSDF_TRANSMISSION)) > 0;
+                            bool isGlossy = bsdf.NumComponents(BxDFType(
+                                    BSDF_GLOSSY | BSDF_REFLECTION |
+                                    BSDF_TRANSMISSION)) > 0;
+                            if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
+                                pixel.vp = {isect.p, wo, &bsdf, nullptr, beta};
+                                break;
+                            }
+
+                            // Spawn ray from SPPM camera path vertex
+                            if (depth < maxDepth - 1) {
+                                Float pdf;
+                                Vector3f wi;
+                                BxDFType type;
+                                Spectrum f =
+                                        bsdf.Sample_f(wo, &wi, localSampler.Get2D(),
+                                                      &pdf, BSDF_ALL, &type);
+                                if (pdf == 0. || f.IsBlack()) break;
+                                specularBounce = (type & BSDF_SPECULAR) != 0;
+                                beta *= f * AbsDot(wi, isect.shading.n) / pdf;
+                                if (beta.y() < 0.25) {
+                                    Float continueProb =
+                                            std::min((Float)1, beta.y());
+                                    if (localSampler.Get1D() > continueProb) break;
+                                    beta /= continueProb;
+                                }
+                                ray = (RayDifferential)isect.SpawnRay(wi);
+                            }
                         }
                     }
                 }
@@ -299,9 +362,9 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             }
 
             // Compute resolution of SPPM grid in each dimension
-            Vector3f diag = gridBounds.Diagonal();
-            Float maxDiag = MaxComponent(diag);
-            int baseGridRes = (int)(maxDiag / maxRadius);
+            const Vector3f diag = gridBounds.Diagonal();
+            const Float maxDiag = MaxComponent(diag);
+            const int baseGridRes = (int)(maxDiag / maxRadius);
             CHECK_GT(baseGridRes, 0);
             for (int i = 0; i < 3; ++i)
                 gridRes[i] = std::max((int)(baseGridRes * diag[i] / maxDiag), 1);
@@ -330,9 +393,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 // Atomically add _node_ to the start of
                                 // _grid[h]_'s linked list
                                 node->next = grid[h];
-                                while (grid[h].compare_exchange_weak(
-                                        node->next, node) == false)
-                                    ;
+                                while (!grid[h].compare_exchange_weak(node->next, node));
                             }
                     ReportValue(gridCellsPerVisiblePoint,
                                 (1 + pMax.x - pMin.x) * (1 + pMax.y - pMin.y) *
@@ -348,27 +409,22 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             ParallelFor([&](int photonIndex) {
                 MemoryArena &arena = photonShootArenas[ThreadIndex];
                 // Follow photon path for _photonIndex_
-                uint64_t haltonIndex =
+                const uint64_t HaltonIndex =
                         (uint64_t)iter * (uint64_t)photonsPerIteration +
                         photonIndex;
-                int haltonDim = 0;
+                AwesomeHaltonSampler localSampler(HaltonIndex);
 
                 // Choose light to shoot photon from
                 Float lightPdf;
-                Float lightSample = RadicalInverse(haltonDim++, haltonIndex);
+                Float lightSample = localSampler.Get1D();
                 int lightNum =
                         lightDistr->SampleDiscrete(lightSample, &lightPdf);
                 const std::shared_ptr<Light> &light = scene.lights[lightNum];
 
                 // Compute sample values for photon ray leaving light source
-                Point2f uLight0(RadicalInverse(haltonDim, haltonIndex),
-                                RadicalInverse(haltonDim + 1, haltonIndex));
-                Point2f uLight1(RadicalInverse(haltonDim + 2, haltonIndex),
-                                RadicalInverse(haltonDim + 3, haltonIndex));
-                Float uLightTime =
-                        Lerp(RadicalInverse(haltonDim + 4, haltonIndex),
-                             camera->shutterOpen, camera->shutterClose);
-                haltonDim += 5;
+                Point2f uLight0 = localSampler.Get2D();
+                Point2f uLight1 = localSampler.Get2D();
+                Float uLightTime = localSampler.Get1D();
 
                 // Generate _photonRay_ from light source and initialize _beta_
                 RayDifferential photonRay;
@@ -386,6 +442,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 SurfaceInteraction isect;
                 for (int depth = 0; depth < maxDepth; ++depth) {
                     if (!scene.Intersect(photonRay, &isect)) break;
+
                     ++totalPhotonSurfaceInteractions;
                     if (depth > 0) {
                         // Add photon contribution to nearby visible points
@@ -400,6 +457,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                  node != nullptr; node = node->next) {
                                 ++visiblePointsChecked;
                                 SPPMPixel &pixel = *node->pixel;
+                                if (!pixel.vp.IsSurfacePoint()) continue;
                                 Float radius = pixel.radius;
                                 if (DistanceSquared(pixel.vp.p, isect.p) >
                                     radius * radius)
@@ -433,10 +491,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     BxDFType flags;
 
                     // Generate _bsdfSample_ for outgoing photon sample
-                    Point2f bsdfSample(
-                            RadicalInverse(haltonDim, haltonIndex),
-                            RadicalInverse(haltonDim + 1, haltonIndex));
-                    haltonDim += 2;
+                    Point2f bsdfSample = localSampler.Get2D();
                     Spectrum fr = photonBSDF.Sample_f(wo, &wi, bsdfSample, &pdf,
                                                       BSDF_ALL, &flags);
                     if (fr.IsBlack() || pdf == 0.f) break;
@@ -445,7 +500,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
 
                     // Possibly terminate photon path with Russian roulette
                     Float q = std::max((Float)0, 1 - bnew.y() / beta.y());
-                    if (RadicalInverse(haltonDim++, haltonIndex) < q) break;
+                    if (localSampler.Get1D() < q) break;
                     beta = bnew / (1 - q);
                     photonRay = (RayDifferential)isect.SpawnRay(wi);
                 }
@@ -478,8 +533,9 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                         p.Phi[j] = (Float)0;
                 }
                 // Reset _VisiblePoint_ in pixel
-                p.vp.beta = 0.;
+                p.vp.beta = 0.0f;
                 p.vp.bsdf = nullptr;
+                p.vp.phase = nullptr;
             }, nPixels, 4096);
         }
 
