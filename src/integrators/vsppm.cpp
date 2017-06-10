@@ -50,6 +50,10 @@ STAT_COUNTER("Stochastic Progressive Photon Mapping/Photon paths followed",
              photonPaths);
 STAT_COUNTER("Stochastic Progressive Photon Mapping/Total photon medium interactions",
              totalPhotonMediumInteractions);
+STAT_COUNTER("Stochastic Progressive Photon Mapping/Total visible points in participating media",
+             totalVisibleMediumPoints);
+STAT_COUNTER("Stochastic Progressive Photon Mapping/Total visible points on surfaces",
+             totalVisibleSurfacePoints);
 STAT_INT_DISTRIBUTION(
         "Stochastic Progressive Photon Mapping/Grid cells per visible point",
         gridCellsPerVisiblePoint);
@@ -279,6 +283,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             pixel.vp.bsdf = nullptr;
                             pixel.vp.phase = mi.phase;
                             pixel.vp.beta = beta;
+                            ++totalVisibleMediumPoints;
                             break;
 
                         } else {
@@ -316,6 +321,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 pixel.vp.bsdf = isect.bsdf;
                                 pixel.vp.phase = nullptr;
                                 pixel.vp.beta = beta;
+                                ++totalVisibleSurfacePoints;
                                 break;
                             }
 
@@ -446,9 +452,17 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 for (int depth = 0; depth < maxDepth; ++depth) {
                     if (!scene.Intersect(photonRay, &isect)) break;
 
-                    ++totalPhotonSurfaceInteractions;
-                    if (depth > 0) {
-                        // Add photon contribution to nearby visible points
+                    MediumInteraction mi;
+                    if (photonRay.medium) beta *= photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
+                    if (beta.IsBlack()) break;
+
+                    // Handle an interaction with a medium or a surface
+                    Spectrum bnew;
+                    Vector3f newWi;
+                    if (mi.IsValid()) {
+                        ++totalPhotonMediumInteractions;
+
+                        // TODO should I only add contrib if depth > 0?
                         Point3i photonGridIndex;
                         if (ToGrid(isect.p, gridBounds, gridRes,
                                    &photonGridIndex)) {
@@ -460,7 +474,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                  node != nullptr; node = node->next) {
                                 ++visiblePointsChecked;
                                 SPPMPixel &pixel = *node->pixel;
-                                if (!pixel.vp.IsSurfacePoint()) continue;
+                                if (!pixel.vp.IsMediumPoint()) continue;
                                 Float radius = pixel.radius;
                                 if (DistanceSquared(pixel.vp.p, isect.p) >
                                     radius * radius)
@@ -468,44 +482,80 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 // Update _pixel_ $\Phi$ and $M$ for nearby
                                 // photon
                                 Vector3f wi = -photonRay.d;
-                                Spectrum Phi =
-                                        beta * pixel.vp.bsdf->f(pixel.vp.wo, wi);
+                                Spectrum Phi = beta * pixel.vp.phase->p(pixel.vp.wo, wi);
                                 for (int i = 0; i < Spectrum::nSamples; ++i)
                                     pixel.Phi[i].Add(Phi[i]);
                                 ++pixel.M;
                             }
+
+                            // Sample new photon ray direction from volume
+                            Vector3f wo = -photonRay.d;
+                            mi.phase->Sample_p(wo, &newWi, localSampler.Get2D());
+                            photonRay = mi.SpawnRay(newWi);
                         }
+
+                    } else {
+                        ++totalPhotonSurfaceInteractions;
+                        if (depth > 0) {
+                            // Add photon contribution to nearby visible points
+                            Point3i photonGridIndex;
+                            if (ToGrid(isect.p, gridBounds, gridRes,
+                                       &photonGridIndex)) {
+                                int h = hash(photonGridIndex, hashSize);
+                                // Add photon contribution to visible points in
+                                // _grid[h]_
+                                for (SPPMPixelListNode *node =
+                                        grid[h].load(std::memory_order_relaxed);
+                                     node != nullptr; node = node->next) {
+                                    ++visiblePointsChecked;
+                                    SPPMPixel &pixel = *node->pixel;
+                                    if (!pixel.vp.IsSurfacePoint()) continue;
+                                    Float radius = pixel.radius;
+                                    if (DistanceSquared(pixel.vp.p, isect.p) >
+                                        radius * radius)
+                                        continue;
+                                    // Update _pixel_ $\Phi$ and $M$ for nearby
+                                    // photon
+                                    Vector3f wi = -photonRay.d;
+                                    Spectrum Phi =
+                                            beta * pixel.vp.bsdf->f(pixel.vp.wo, wi);
+                                    for (int i = 0; i < Spectrum::nSamples; ++i)
+                                        pixel.Phi[i].Add(Phi[i]);
+                                    ++pixel.M;
+                                }
+                            }
+                        }
+                        // Sample new photon ray direction from surface
+
+                        // Compute BSDF at photon intersection point
+                        isect.ComputeScatteringFunctions(photonRay, arena, true,
+                                                         TransportMode::Importance);
+                        if (!isect.bsdf) {
+                            --depth;
+                            photonRay = isect.SpawnRay(photonRay.d);
+                            continue;
+                        }
+                        const BSDF &photonBSDF = *isect.bsdf;
+
+                        // Sample BSDF _fr_ and direction _wi_ for reflected photon
+                        Vector3f wo = -photonRay.d;
+                        Float pdf;
+                        BxDFType flags;
+
+                        // Generate _bsdfSample_ for outgoing photon sample
+                        Point2f bsdfSample = localSampler.Get2D();
+                        Spectrum fr = photonBSDF.Sample_f(wo, &newWi, bsdfSample, &pdf,
+                                                          BSDF_ALL, &flags);
+                        if (fr.IsBlack() || pdf == 0.f) break;
+                        bnew = beta * fr * AbsDot(newWi, isect.shading.n) / pdf;
+
+                        photonRay = (RayDifferential) isect.SpawnRay(newWi);
                     }
-                    // Sample new photon ray direction
-
-                    // Compute BSDF at photon intersection point
-                    isect.ComputeScatteringFunctions(photonRay, arena, true,
-                                                     TransportMode::Importance);
-                    if (!isect.bsdf) {
-                        --depth;
-                        photonRay = isect.SpawnRay(photonRay.d);
-                        continue;
-                    }
-                    const BSDF &photonBSDF = *isect.bsdf;
-
-                    // Sample BSDF _fr_ and direction _wi_ for reflected photon
-                    Vector3f wi, wo = -photonRay.d;
-                    Float pdf;
-                    BxDFType flags;
-
-                    // Generate _bsdfSample_ for outgoing photon sample
-                    Point2f bsdfSample = localSampler.Get2D();
-                    Spectrum fr = photonBSDF.Sample_f(wo, &wi, bsdfSample, &pdf,
-                                                      BSDF_ALL, &flags);
-                    if (fr.IsBlack() || pdf == 0.f) break;
-                    Spectrum bnew =
-                            beta * fr * AbsDot(wi, isect.shading.n) / pdf;
 
                     // Possibly terminate photon path with Russian roulette
                     Float q = std::max((Float) 0, 1 - bnew.y() / beta.y());
                     if (localSampler.Get1D() < q) break;
                     beta = bnew / (1 - q);
-                    photonRay = (RayDifferential) isect.SpawnRay(wi);
                 }
                 arena.Reset();
             }, photonsPerIteration, 8192);

@@ -1449,10 +1449,6 @@ Integrator *RenderOptions::MakeIntegrator() const {
         integrator = CreatePathIntegrator(IntegratorParams, sampler, camera);
     else if (IntegratorName == "volpath")
         integrator = CreateVolPathIntegrator(IntegratorParams, sampler, camera);
-    else if (IntegratorName == "photonmap")
-        integrator = CreatePhotonMapIntegrator(IntegratorParams, sampler, camera);
-    else if (IntegratorName == "volphotonmap")
-        integrator = CreateVolPhotonMapIntegrator(IntegratorParams, sampler, camera);
     else if (IntegratorName == "bdpt")
         integrator = CreateBDPTIntegrator(IntegratorParams, sampler, camera);
     else if (IntegratorName == "mlt")
@@ -1469,7 +1465,7 @@ Integrator *RenderOptions::MakeIntegrator() const {
     }
 
     if (renderOptions->haveScatteringMedia && IntegratorName != "volpath" &&
-        IntegratorName != "bdpt" && IntegratorName != "mlt" && IntegratorName != "volphotonmap") {
+        IntegratorName != "bdpt" && IntegratorName != "mlt" && IntegratorName != "vsppm") {
         Warning(
             "Scene has scattering media but \"%s\" integrator doesn't support "
             "volume scattering. Consider using \"volpath\", \"bdpt\", or "
