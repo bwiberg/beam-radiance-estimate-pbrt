@@ -1,8 +1,37 @@
-/**
- * Created by Benjamin Wiberg on 09/06/2017.
+
+/*
+    pbrt source code is Copyright(c) 1998-2016
+                        Matt Pharr, Greg Humphreys, and Wenzel Jakob.
+
+    This file is part of pbrt.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+    - Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+    IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+    TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+    PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
  */
 
-// integrators/vsppm.cpp*
+
+// integrators/sppm.cpp*
 #include "integrators/vsppm.h"
 #include "parallel.h"
 #include "scene.h"
@@ -19,73 +48,45 @@
 namespace pbrt {
 
 STAT_RATIO(
-        "Volumetric Stochastic Progressive Photon Mapping/Visible points checked per photon "
+        "Stochastic Progressive Photon Mapping/Visible points checked per photon "
                 "intersection",
         visiblePointsChecked, totalPhotonSurfaceInteractions);
-STAT_COUNTER("Volumetric Stochastic Progressive Photon Mapping/Total Photon<=>Medium interactions ",
-             totalPhotonMediumInteractions);
-STAT_COUNTER("Volumetric Stochastic Progressive Photon Mapping/Photon paths followed",
+STAT_COUNTER("Stochastic Progressive Photon Mapping/Photon paths followed",
              photonPaths);
 STAT_INT_DISTRIBUTION(
-        "Volumetric Stochastic Progressive Photon Mapping/Grid cells per visible point",
+        "Stochastic Progressive Photon Mapping/Grid cells per visible point",
         gridCellsPerVisiblePoint);
-STAT_MEMORY_COUNTER("Memory/VSPPM Pixels", pixelMemoryBytes);
-STAT_FLOAT_DISTRIBUTION("Memory/VSPPM BSDF and Grid Memory", memoryArenaMB);
+STAT_MEMORY_COUNTER("Memory/SPPM Pixels", pixelMemoryBytes);
+STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 
-struct VisibleSurfacePoint {
-    VisibleSurfacePoint() {}
-    VisibleSurfacePoint(const Point3f &p, const Vector3f &wo,
-                        const BSDF *bsdf,
-                        const Spectrum &beta)
-            : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
-    Point3f p;
-    Vector3f wo;
-    const BSDF *bsdf = nullptr;
-    Spectrum beta;
-};
+// SPPM Local Definitions
+struct SPPMPixel {
+    // SPPMPixel Public Methods
+    SPPMPixel() : M(0) {}
 
-struct VisibleMediumPoint {
-    VisibleMediumPoint() {}
-    VisibleMediumPoint(const Point3f &p, const Vector3f &wo,
-                       const Medium *medium, const BSDF *bsdf,
-                       const Spectrum &beta)
-            : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
-    Point3f p;
-    Vector3f wo;
-    const Medium *medium = nullptr;
-    const BSDF *bsdf = nullptr;
-    Spectrum beta;
-};
-
-// VolSPPM Local Definitions
-struct VolSPPMPixel {
-    // VolSPPMPixel Public Methods
-    VolSPPMPixel() : M(0) {}
-
-    // VolSPPMPixel Public Data
+    // SPPMPixel Public Data
     Float radius = 0;
     Spectrum Ld;
-    VisibleSurfacePoint *vsp;
-    VisibleMediumPoint *vmp;
-
-    bool HasSurfacePoint() const {
-        DCHECK((vsp && !vmp) || (!vsp && vmp));
-        return vsp != nullptr;
-    }
-
-    bool HasMediumPoint() const {
-        return !HasSurfacePoint();
-    }
-
+    struct VisiblePoint {
+        // VisiblePoint Public Methods
+        VisiblePoint() {}
+        VisiblePoint(const Point3f &p, const Vector3f &wo, const BSDF *bsdf,
+                     const Spectrum &beta)
+                : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
+        Point3f p;
+        Vector3f wo;
+        const BSDF *bsdf = nullptr;
+        Spectrum beta;
+    } vp;
     AtomicFloat Phi[Spectrum::nSamples];
     std::atomic<int> M;
     Float N = 0;
     Spectrum tau;
 };
 
-struct VolSPPMPixelListNode {
-    VolSPPMPixel *pixel;
-    VolSPPMPixelListNode *next;
+struct SPPMPixelListNode {
+    SPPMPixel *pixel;
+    SPPMPixelListNode *next;
 };
 
 static bool ToGrid(const Point3f &p, const Bounds3f &bounds,
@@ -143,16 +144,16 @@ private:
     size_t sampleCount;
 };
 
-// VolSPPM Method Definitions
+// SPPM Method Definitions
 void VolSPPMIntegrator::Render(const Scene &scene) {
     ProfilePhase p(Prof::IntegratorRender);
-    // Initialize _pixelBounds_ and _pixels_ array for VolSPPM
+    // Initialize _pixelBounds_ and _pixels_ array for SPPM
     Bounds2i pixelBounds = camera->film->croppedPixelBounds;
     int nPixels = pixelBounds.Area();
-    std::unique_ptr<VolSPPMPixel[]> pixels(new VolSPPMPixel[nPixels]);
+    std::unique_ptr<SPPMPixel[]> pixels(new SPPMPixel[nPixels]);
     for (int i = 0; i < nPixels; ++i) pixels[i].radius = initialSearchRadius;
     const Float invSqrtSPP = 1.f / std::sqrt(nIterations);
-    pixelMemoryBytes = nPixels * sizeof(VolSPPMPixel);
+    pixelMemoryBytes = nPixels * sizeof(SPPMPixel);
     // Compute _lightDistr_ for sampling lights proportional to power
     std::unique_ptr<Distribution1D> lightDistr =
             ComputeLightPowerDistribution(scene);
@@ -167,8 +168,6 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                    (pixelExtent.y + tileSize - 1) / tileSize);
     ProgressReporter progress(2 * nIterations, "Rendering");
 
-    RNG rng;
-
     for (int iter = 0; iter < nIterations; ++iter) {
         // Generate VolSPPM visible points
         std::vector<MemoryArena> perThreadArenas(MaxThreadIndex());
@@ -177,21 +176,26 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             ParallelFor2D([&](Point2i tile) {
                 MemoryArena &arena = perThreadArenas[ThreadIndex];
                 // Follow camera paths for _tile_ in image for VolSPPM
-                int tileIndex = tile.y * nTiles.x + tile.x;
-                std::unique_ptr<Sampler> tileSampler = sampler.Clone(tileIndex);
+                const int TileIndex = tile.y * nTiles.x + tile.x;
+                std::unique_ptr<Sampler> tileSampler = sampler.Clone(TileIndex);
                 // Compute _tileBounds_ for VolSPPM tile
                 int x0 = pixelBounds.pMin.x + tile.x * tileSize;
                 int x1 = std::min(x0 + tileSize, pixelBounds.pMax.x);
                 int y0 = pixelBounds.pMin.y + tile.y * tileSize;
                 int y1 = std::min(y0 + tileSize, pixelBounds.pMax.y);
                 Bounds2i tileBounds(Point2i(x0, y0), Point2i(x1, y1));
+
+                const uint64_t RngOffset = static_cast<uint64_t>(pixelBounds.Area() * iter
+                                                                 + tileBounds.Area() * TileIndex);
+
                 for (Point2i pPixel : tileBounds) {
+                    const uint32_t PixelIndex = static_cast<uint32_t>(pPixel.y * tileBounds.Diagonal().x + pPixel.x);
                     // Prepare _tileSampler_ for _pPixel_
                     tileSampler->StartPixel(pPixel);
                     tileSampler->SetSampleNumber(iter);
-                    AwesomeSampler localSampler(0, *tileSampler, 1000, rng.UniformUInt32());
+                    AwesomeSampler localSampler(0, *tileSampler, 1000, RngOffset + PixelIndex);
 
-                    // Generate camera ray for pixel for VolSPPM
+                    // Generate camera ray for pixel for SPPM
                     CameraSample cameraSample =
                             localSampler.GetCameraSample(pPixel);
                     RayDifferential ray;
@@ -206,16 +210,11 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     int pixelOffset =
                             pPixelO.x +
                             pPixelO.y * (pixelBounds.pMax.x - pixelBounds.pMin.x);
-                    VolSPPMPixel &pixel = pixels[pixelOffset];
+                    SPPMPixel &pixel = pixels[pixelOffset];
                     bool specularBounce = false;
-
-                    /**
-                     * Create a VisibleXxxPoint for current VolSPPMPixel
-                     */
                     for (int depth = 0; depth < maxDepth; ++depth) {
                         SurfaceInteraction isect;
-
-                        // Process VolSPPM camera ray intersection
+                        ++totalPhotonSurfaceInteractions;
                         if (!scene.Intersect(ray, &isect)) {
                             // Accumulate light contributions for ray with no
                             // intersection
@@ -223,103 +222,83 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 pixel.Ld += beta * light->Le(ray);
                             break;
                         }
+                        // Process SPPM camera ray intersection
 
-                        // Participating media interaction
-                        MediumInteraction mi;
-                        if (ray.medium) beta *= ray.medium->Sample(ray, localSampler, arena, &mi);
-                        if (beta.IsBlack()) break;
+                        // Compute BSDF at SPPM camera ray intersection
+                        isect.ComputeScatteringFunctions(ray, arena, true);
+                        if (!isect.bsdf) {
+                            ray = isect.SpawnRay(ray.d);
+                            --depth;
+                            continue;
+                        }
+                        const BSDF &bsdf = *isect.bsdf;
 
-                        if (false/*mi.IsValid()*/) {
-                            ++totalPhotonMediumInteractions;
-                            /**
-                             * Place a visible point in the participating medium
-                             */
+                        // Accumulate direct illumination at SPPM camera ray
+                        // intersection
+                        Vector3f wo = -ray.d;
+                        if (depth == 0 || specularBounce)
+                            pixel.Ld += beta * isect.Le(wo);
+                        pixel.Ld +=
+                                beta * UniformSampleOneLight(isect, scene, arena,
+                                                             localSampler);
 
-
-                        } else {
-                            ++totalPhotonSurfaceInteractions;
-                            /**
-                             * Place a visible point on the surface
-                             */
-
-                            // Compute BSDF at VolSPPM camera ray intersection
-                            isect.ComputeScatteringFunctions(ray, arena, true);
-                            if (!isect.bsdf) {
-                                ray = isect.SpawnRay(ray.d);
-                                --depth;
-                                continue;
-                            }
-                            const BSDF &bsdf = *isect.bsdf;
-
-                            // Accumulate direct illumination at VolSPPM camera ray
-                            // intersection
-                            Vector3f wo = -ray.d;
-                            if (depth == 0 || specularBounce)
-                                pixel.Ld += beta * isect.Le(wo);
-                            pixel.Ld +=
-                                    beta * UniformSampleOneLight(isect, scene, arena,
-                                                                 localSampler);
-
-                            // Possibly create visible point and end camera path
-                            bool isDiffuse = bsdf.NumComponents(BxDFType(
-                                    BSDF_DIFFUSE | BSDF_REFLECTION |
-                                    BSDF_TRANSMISSION)) > 0;
-                            bool isGlossy = bsdf.NumComponents(BxDFType(
-                                    BSDF_GLOSSY | BSDF_REFLECTION |
-                                    BSDF_TRANSMISSION)) > 0;
-                            if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
-                                pixel.vsp = new VisibleSurfacePoint{isect.p, wo, &bsdf, beta};
-                                break;
-                            }
-
-                            // Spawn ray from VolSPPM camera path vertex
-                            if (depth < maxDepth - 1) {
-                                Float pdf;
-                                Vector3f wi;
-                                BxDFType type;
-                                Spectrum f =
-                                        bsdf.Sample_f(wo, &wi, localSampler.Get2D(),
-                                                      &pdf, BSDF_ALL, &type);
-                                if (pdf == 0. || f.IsBlack()) break;
-                                specularBounce = (type & BSDF_SPECULAR) != 0;
-                                beta *= f * AbsDot(wi, isect.shading.n) / pdf;
-                                if (beta.y() < 0.25) {
-                                    Float continueProb =
-                                            std::min((Float)1, beta.y());
-                                    if (localSampler.Get1D() > continueProb) break;
-                                    beta /= continueProb;
-                                }
-                                ray = (RayDifferential)isect.SpawnRay(wi);
-                            }
+                        // Possibly create visible point and end camera path
+                        bool isDiffuse = bsdf.NumComponents(BxDFType(
+                                BSDF_DIFFUSE | BSDF_REFLECTION |
+                                BSDF_TRANSMISSION)) > 0;
+                        bool isGlossy = bsdf.NumComponents(BxDFType(
+                                BSDF_GLOSSY | BSDF_REFLECTION |
+                                BSDF_TRANSMISSION)) > 0;
+                        if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
+                            pixel.vp = {isect.p, wo, &bsdf, beta};
+                            break;
                         }
 
-
+                        // Spawn ray from SPPM camera path vertex
+                        if (depth < maxDepth - 1) {
+                            Float pdf;
+                            Vector3f wi;
+                            BxDFType type;
+                            Spectrum f =
+                                    bsdf.Sample_f(wo, &wi, localSampler.Get2D(),
+                                                  &pdf, BSDF_ALL, &type);
+                            if (pdf == 0. || f.IsBlack()) break;
+                            specularBounce = (type & BSDF_SPECULAR) != 0;
+                            beta *= f * AbsDot(wi, isect.shading.n) / pdf;
+                            if (beta.y() < 0.25) {
+                                Float continueProb =
+                                        std::min((Float)1, beta.y());
+                                if (localSampler.Get1D() > continueProb) break;
+                                beta /= continueProb;
+                            }
+                            ray = (RayDifferential)isect.SpawnRay(wi);
+                        }
                     }
                 }
             }, nTiles);
         }
         progress.Update();
 
-        // Create grid of all VolSPPM visible points
+        // Create grid of all SPPM visible points
         int gridRes[3];
         Bounds3f gridBounds;
-        // Allocate grid for VolSPPM visible points
+        // Allocate grid for SPPM visible points
         const int hashSize = nPixels;
-        std::vector<std::atomic<VolSPPMPixelListNode *>> grid(hashSize);
+        std::vector<std::atomic<SPPMPixelListNode *>> grid(hashSize);
         {
             ProfilePhase _(Prof::SPPMGridConstruction);
 
-            // Compute grid bounds for VolSPPM visible points
+            // Compute grid bounds for SPPM visible points
             Float maxRadius = 0.;
             for (int i = 0; i < nPixels; ++i) {
-                const VolSPPMPixel &pixel = pixels[i];
-                if (pixel.vsp->beta.IsBlack()) continue;
-                Bounds3f vpBound = Expand(Bounds3f(pixel.vsp->p), pixel.radius);
+                const SPPMPixel &pixel = pixels[i];
+                if (pixel.vp.beta.IsBlack()) continue;
+                Bounds3f vpBound = Expand(Bounds3f(pixel.vp.p), pixel.radius);
                 gridBounds = Union(gridBounds, vpBound);
                 maxRadius = std::max(maxRadius, pixel.radius);
             }
 
-            // Compute resolution of VolSPPM grid in each dimension
+            // Compute resolution of SPPM grid in each dimension
             Vector3f diag = gridBounds.Diagonal();
             Float maxDiag = MaxComponent(diag);
             int baseGridRes = (int)(maxDiag / maxRadius);
@@ -327,25 +306,25 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             for (int i = 0; i < 3; ++i)
                 gridRes[i] = std::max((int)(baseGridRes * diag[i] / maxDiag), 1);
 
-            // Add visible points to VolSPPM grid
+            // Add visible points to SPPM grid
             ParallelFor([&](int pixelIndex) {
                 MemoryArena &arena = perThreadArenas[ThreadIndex];
-                VolSPPMPixel &pixel = pixels[pixelIndex];
-                if (!pixel.vsp->beta.IsBlack()) {
+                SPPMPixel &pixel = pixels[pixelIndex];
+                if (!pixel.vp.beta.IsBlack()) {
                     // Add pixel's visible point to applicable grid cells
                     Float radius = pixel.radius;
                     Point3i pMin, pMax;
-                    ToGrid(pixel.vsp->p - Vector3f(radius, radius, radius),
+                    ToGrid(pixel.vp.p - Vector3f(radius, radius, radius),
                            gridBounds, gridRes, &pMin);
-                    ToGrid(pixel.vsp->p + Vector3f(radius, radius, radius),
+                    ToGrid(pixel.vp.p + Vector3f(radius, radius, radius),
                            gridBounds, gridRes, &pMax);
                     for (int z = pMin.z; z <= pMax.z; ++z)
                         for (int y = pMin.y; y <= pMax.y; ++y)
                             for (int x = pMin.x; x <= pMax.x; ++x) {
                                 // Add visible point to grid cell $(x, y, z)$
                                 int h = hash(Point3i(x, y, z), hashSize);
-                                VolSPPMPixelListNode *node =
-                                        arena.Alloc<VolSPPMPixelListNode>();
+                                SPPMPixelListNode *node =
+                                        arena.Alloc<SPPMPixelListNode>();
                                 node->pixel = &pixel;
 
                                 // Atomically add _node_ to the start of
@@ -416,20 +395,20 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             int h = hash(photonGridIndex, hashSize);
                             // Add photon contribution to visible points in
                             // _grid[h]_
-                            for (VolSPPMPixelListNode *node =
+                            for (SPPMPixelListNode *node =
                                     grid[h].load(std::memory_order_relaxed);
                                  node != nullptr; node = node->next) {
                                 ++visiblePointsChecked;
-                                VolSPPMPixel &pixel = *node->pixel;
+                                SPPMPixel &pixel = *node->pixel;
                                 Float radius = pixel.radius;
-                                if (DistanceSquared(pixel.vsp->p, isect.p) >
+                                if (DistanceSquared(pixel.vp.p, isect.p) >
                                     radius * radius)
                                     continue;
                                 // Update _pixel_ $\Phi$ and $M$ for nearby
                                 // photon
                                 Vector3f wi = -photonRay.d;
                                 Spectrum Phi =
-                                        beta * pixel.vsp->bsdf->f(pixel.vsp->wo, wi);
+                                        beta * pixel.vp.bsdf->f(pixel.vp.wo, wi);
                                 for (int i = 0; i < Spectrum::nSamples; ++i)
                                     pixel.Phi[i].Add(Phi[i]);
                                 ++pixel.M;
@@ -480,7 +459,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
         {
             ProfilePhase _(Prof::SPPMStatsUpdate);
             ParallelFor([&](int i) {
-                VolSPPMPixel &p = pixels[i];
+                SPPMPixel &p = pixels[i];
                 if (p.M > 0) {
                     // Update pixel photon count, search radius, and $\tau$ from
                     // photons
@@ -490,7 +469,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     Spectrum Phi;
                     for (int j = 0; j < Spectrum::nSamples; ++j)
                         Phi[j] = p.Phi[j];
-                    p.tau = (p.tau + p.vsp->beta * Phi) * (Rnew * Rnew) /
+                    p.tau = (p.tau + p.vp.beta * Phi) * (Rnew * Rnew) /
                             (p.radius * p.radius);
                     p.N = Nnew;
                     p.radius = Rnew;
@@ -499,12 +478,12 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                         p.Phi[j] = (Float)0;
                 }
                 // Reset _VisiblePoint_ in pixel
-                p.vsp->beta = 0.;
-                p.vsp->bsdf = nullptr;
+                p.vp.beta = 0.;
+                p.vp.bsdf = nullptr;
             }, nPixels, 4096);
         }
 
-        // Periodically store VolSPPM image in film and write image
+        // Periodically store SPPM image in film and write image
         if (iter + 1 == nIterations || ((iter + 1) % writeFrequency) == 0) {
             int x0 = pixelBounds.pMin.x;
             int x1 = pixelBounds.pMax.x;
@@ -513,8 +492,8 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             int offset = 0;
             for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                 for (int x = x0; x < x1; ++x) {
-                    // Compute radiance _L_ for VolSPPM pixel _pixel_
-                    const VolSPPMPixel &pixel =
+                    // Compute radiance _L_ for SPPM pixel _pixel_
+                    const SPPMPixel &pixel =
                             pixels[(y - pixelBounds.pMin.y) * (x1 - x0) + (x - x0)];
                     Spectrum L = pixel.Ld / (iter + 1);
                     L += pixel.tau / (Np * Pi * pixel.radius * pixel.radius);
@@ -523,14 +502,14 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             }
             camera->film->SetImage(image.get());
             camera->film->WriteImage();
-            // Write VolSPPM radius image, if requested
+            // Write SPPM radius image, if requested
             if (getenv("SPPM_RADIUS")) {
                 std::unique_ptr<Float[]> rimg(
                         new Float[3 * pixelBounds.Area()]);
                 Float minrad = 1e30f, maxrad = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const VolSPPMPixel &p =
+                        const SPPMPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         minrad = std::min(minrad, p.radius);
@@ -543,7 +522,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 int offset = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const VolSPPMPixel &p =
+                        const SPPMPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         Float v = 1.f - (p.radius - minrad) / (maxrad - minrad);
