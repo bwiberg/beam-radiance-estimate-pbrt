@@ -61,6 +61,26 @@ STAT_INT_DISTRIBUTION(
 STAT_MEMORY_COUNTER("Memory/SPPM Pixels", pixelMemoryBytes);
 STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 
+struct VisiblePoint {
+    // VisiblePoint Public Methods
+    VisiblePoint() : bsdf(nullptr), phase(nullptr) {}
+    Point3f p;
+    Vector3f wo;
+    const BSDF *bsdf;
+    const PhaseFunction *phase;
+    Spectrum beta;
+
+    bool IsSurfacePoint() {
+        CHECK((bsdf && !phase) || (!bsdf && phase));
+        return bsdf != nullptr;
+    }
+
+    bool IsMediumPoint() {
+        CHECK((bsdf && !phase) || (!bsdf && phase));
+        return phase != nullptr;
+    }
+};
+
 // SPPM Local Definitions
 struct SPPMPixel {
     // SPPMPixel Public Methods
@@ -69,29 +89,7 @@ struct SPPMPixel {
     // SPPMPixel Public Data
     Float radius = 0;
     Spectrum Ld;
-    struct VisiblePoint {
-        // VisiblePoint Public Methods
-        VisiblePoint() {}
-        VisiblePoint(const Point3f &p, const Vector3f &wo,
-                     const BSDF *bsdf, const PhaseFunction *phase,
-                     const Spectrum &beta)
-                : p(p), wo(wo), bsdf(bsdf), phase(phase), beta(beta) {}
-        Point3f p;
-        Vector3f wo;
-        const BSDF *bsdf;
-        const PhaseFunction *phase;
-        Spectrum beta;
-
-        bool IsSurfacePoint() {
-            CHECK((bsdf && !phase) || (!bsdf && phase));
-            return bsdf != nullptr;
-        }
-
-        bool IsMediumPoint() {
-            CHECK((bsdf && !phase) || (!bsdf && phase));
-            return phase != nullptr;
-        }
-    } vp;
+    VisiblePoint vp;
     AtomicFloat Phi[Spectrum::nSamples];
     std::atomic<int> M;
     Float N = 0;
@@ -279,7 +277,11 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                                                  localSampler, true);
 
                             // Create visible point and end camera path
-                            pixel.vp = {mi.p, wo, nullptr, mi.phase, beta};
+                            pixel.vp.p = mi.p;
+                            pixel.vp.wo = wo;
+                            pixel.vp.bsdf = nullptr;
+                            pixel.vp.phase = mi.phase;
+                            pixel.vp.beta = beta;
                             break;
 
                         } else {
@@ -312,7 +314,11 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                     BSDF_GLOSSY | BSDF_REFLECTION |
                                     BSDF_TRANSMISSION)) > 0;
                             if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
-                                pixel.vp = {isect.p, wo, &bsdf, nullptr, beta};
+                                pixel.vp.p = isect.p;
+                                pixel.vp.wo = wo;
+                                pixel.vp.bsdf = isect.bsdf;
+                                pixel.vp.phase = nullptr;
+                                pixel.vp.beta = beta;
                                 break;
                             }
 
