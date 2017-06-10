@@ -22,6 +22,8 @@ STAT_RATIO(
         "Volumetric Stochastic Progressive Photon Mapping/Visible points checked per photon "
                 "intersection",
         visiblePointsChecked, totalPhotonSurfaceInteractions);
+STAT_COUNTER("Volumetric Stochastic Progressive Photon Mapping/Total Photon<=>Medium interactions ",
+             totalPhotonMediumInteractions);
 STAT_COUNTER("Volumetric Stochastic Progressive Photon Mapping/Photon paths followed",
              photonPaths);
 STAT_INT_DISTRIBUTION(
@@ -29,6 +31,31 @@ STAT_INT_DISTRIBUTION(
         gridCellsPerVisiblePoint);
 STAT_MEMORY_COUNTER("Memory/VSPPM Pixels", pixelMemoryBytes);
 STAT_FLOAT_DISTRIBUTION("Memory/VSPPM BSDF and Grid Memory", memoryArenaMB);
+
+struct VisibleSurfacePoint {
+    VisibleSurfacePoint() {}
+    VisibleSurfacePoint(const Point3f &p, const Vector3f &wo,
+                        const BSDF *bsdf,
+                        const Spectrum &beta)
+            : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
+    Point3f p;
+    Vector3f wo;
+    const BSDF *bsdf = nullptr;
+    Spectrum beta;
+};
+
+struct VisibleMediumPoint {
+    VisibleMediumPoint() {}
+    VisibleMediumPoint(const Point3f &p, const Vector3f &wo,
+                       const Medium *medium, const BSDF *bsdf,
+                       const Spectrum &beta)
+            : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
+    Point3f p;
+    Vector3f wo;
+    const Medium *medium = nullptr;
+    const BSDF *bsdf = nullptr;
+    Spectrum beta;
+};
 
 // VolSPPM Local Definitions
 struct VolSPPMPixel {
@@ -38,17 +65,18 @@ struct VolSPPMPixel {
     // VolSPPMPixel Public Data
     Float radius = 0;
     Spectrum Ld;
-    struct VisiblePoint {
-        // VisiblePoint Public Methods
-        VisiblePoint() {}
-        VisiblePoint(const Point3f &p, const Vector3f &wo, const BSDF *bsdf,
-                     const Spectrum &beta)
-                : p(p), wo(wo), bsdf(bsdf), beta(beta) {}
-        Point3f p;
-        Vector3f wo;
-        const BSDF *bsdf = nullptr;
-        Spectrum beta;
-    } vp;
+    VisibleSurfacePoint *vsp;
+    VisibleMediumPoint *vmp;
+
+    bool HasSurfacePoint() const {
+        DCHECK((vsp && !vmp) || (!vsp && vmp));
+        return vsp != nullptr;
+    }
+
+    bool HasMediumPoint() const {
+        return !HasSurfacePoint();
+    }
+
     AtomicFloat Phi[Spectrum::nSamples];
     std::atomic<int> M;
     Float N = 0;
@@ -78,6 +106,43 @@ inline unsigned int hash(const Point3i &p, int hashSize) {
            hashSize;
 }
 
+class AwesomeSampler : public Sampler {
+public:
+    AwesomeSampler(int64_t samplesPerPixel,
+                   Sampler &sampler,
+                   size_t const SamplerLimit,
+                   uint64_t rngSeed) : Sampler(samplesPerPixel),
+                                       rng(rngSeed),
+                                       sampler(sampler),
+                                       SamplerLimit(SamplerLimit),
+                                       sampleCount(0) {}
+
+    Float Get1D() override {
+        sampleCount++;
+        if (sampleCount <= SamplerLimit) {
+            return sampler.Get1D();
+        }
+        return rng.UniformFloat();
+    }
+
+    Point2f Get2D() override {
+        sampleCount += 2;
+        if (sampleCount <= SamplerLimit) {
+            return sampler.Get2D();
+        }
+        return Point2f(rng.UniformFloat(), rng.UniformFloat());
+    }
+
+    std::unique_ptr<Sampler> Clone(int seed) override {
+        return nullptr;
+    }
+private:
+    RNG rng;
+    Sampler &sampler;
+    const size_t SamplerLimit;
+    size_t sampleCount;
+};
+
 // VolSPPM Method Definitions
 void VolSPPMIntegrator::Render(const Scene &scene) {
     ProfilePhase p(Prof::IntegratorRender);
@@ -101,6 +166,9 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
     Point2i nTiles((pixelExtent.x + tileSize - 1) / tileSize,
                    (pixelExtent.y + tileSize - 1) / tileSize);
     ProgressReporter progress(2 * nIterations, "Rendering");
+
+    RNG rng;
+
     for (int iter = 0; iter < nIterations; ++iter) {
         // Generate VolSPPM visible points
         std::vector<MemoryArena> perThreadArenas(MaxThreadIndex());
@@ -111,7 +179,6 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 // Follow camera paths for _tile_ in image for VolSPPM
                 int tileIndex = tile.y * nTiles.x + tile.x;
                 std::unique_ptr<Sampler> tileSampler = sampler.Clone(tileIndex);
-
                 // Compute _tileBounds_ for VolSPPM tile
                 int x0 = pixelBounds.pMin.x + tile.x * tileSize;
                 int x1 = std::min(x0 + tileSize, pixelBounds.pMax.x);
@@ -122,10 +189,11 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     // Prepare _tileSampler_ for _pPixel_
                     tileSampler->StartPixel(pPixel);
                     tileSampler->SetSampleNumber(iter);
+                    AwesomeSampler localSampler(0, *tileSampler, 1000, rng.UniformUInt32());
 
                     // Generate camera ray for pixel for VolSPPM
                     CameraSample cameraSample =
-                            tileSampler->GetCameraSample(pPixel);
+                            localSampler.GetCameraSample(pPixel);
                     RayDifferential ray;
                     Spectrum beta =
                             camera->GenerateRayDifferential(cameraSample, &ray);
@@ -140,9 +208,14 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             pPixelO.y * (pixelBounds.pMax.x - pixelBounds.pMin.x);
                     VolSPPMPixel &pixel = pixels[pixelOffset];
                     bool specularBounce = false;
+
+                    /**
+                     * Create a VisibleXxxPoint for current VolSPPMPixel
+                     */
                     for (int depth = 0; depth < maxDepth; ++depth) {
                         SurfaceInteraction isect;
-                        ++totalPhotonSurfaceInteractions;
+
+                        // Process VolSPPM camera ray intersection
                         if (!scene.Intersect(ray, &isect)) {
                             // Accumulate light contributions for ray with no
                             // intersection
@@ -150,57 +223,77 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 pixel.Ld += beta * light->Le(ray);
                             break;
                         }
-                        // Process VolSPPM camera ray intersection
 
-                        // Compute BSDF at VolSPPM camera ray intersection
-                        isect.ComputeScatteringFunctions(ray, arena, true);
-                        if (!isect.bsdf) {
-                            ray = isect.SpawnRay(ray.d);
-                            --depth;
-                            continue;
-                        }
-                        const BSDF &bsdf = *isect.bsdf;
+                        // Participating media interaction
+                        MediumInteraction mi;
+                        if (ray.medium) beta *= ray.medium->Sample(ray, localSampler, arena, &mi);
+                        if (beta.IsBlack()) break;
 
-                        // Accumulate direct illumination at VolSPPM camera ray
-                        // intersection
-                        Vector3f wo = -ray.d;
-                        if (depth == 0 || specularBounce)
-                            pixel.Ld += beta * isect.Le(wo);
-                        pixel.Ld +=
-                                beta * UniformSampleOneLight(isect, scene, arena,
-                                                             *tileSampler);
+                        if (false/*mi.IsValid()*/) {
+                            ++totalPhotonMediumInteractions;
+                            /**
+                             * Place a visible point in the participating medium
+                             */
 
-                        // Possibly create visible point and end camera path
-                        bool isDiffuse = bsdf.NumComponents(BxDFType(
-                                BSDF_DIFFUSE | BSDF_REFLECTION |
-                                BSDF_TRANSMISSION)) > 0;
-                        bool isGlossy = bsdf.NumComponents(BxDFType(
-                                BSDF_GLOSSY | BSDF_REFLECTION |
-                                BSDF_TRANSMISSION)) > 0;
-                        if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
-                            pixel.vp = {isect.p, wo, &bsdf, beta};
-                            break;
-                        }
 
-                        // Spawn ray from VolSPPM camera path vertex
-                        if (depth < maxDepth - 1) {
-                            Float pdf;
-                            Vector3f wi;
-                            BxDFType type;
-                            Spectrum f =
-                                    bsdf.Sample_f(wo, &wi, tileSampler->Get2D(),
-                                                  &pdf, BSDF_ALL, &type);
-                            if (pdf == 0. || f.IsBlack()) break;
-                            specularBounce = (type & BSDF_SPECULAR) != 0;
-                            beta *= f * AbsDot(wi, isect.shading.n) / pdf;
-                            if (beta.y() < 0.25) {
-                                Float continueProb =
-                                        std::min((Float)1, beta.y());
-                                if (tileSampler->Get1D() > continueProb) break;
-                                beta /= continueProb;
+                        } else {
+                            ++totalPhotonSurfaceInteractions;
+                            /**
+                             * Place a visible point on the surface
+                             */
+
+                            // Compute BSDF at VolSPPM camera ray intersection
+                            isect.ComputeScatteringFunctions(ray, arena, true);
+                            if (!isect.bsdf) {
+                                ray = isect.SpawnRay(ray.d);
+                                --depth;
+                                continue;
                             }
-                            ray = (RayDifferential)isect.SpawnRay(wi);
+                            const BSDF &bsdf = *isect.bsdf;
+
+                            // Accumulate direct illumination at VolSPPM camera ray
+                            // intersection
+                            Vector3f wo = -ray.d;
+                            if (depth == 0 || specularBounce)
+                                pixel.Ld += beta * isect.Le(wo);
+                            pixel.Ld +=
+                                    beta * UniformSampleOneLight(isect, scene, arena,
+                                                                 localSampler);
+
+                            // Possibly create visible point and end camera path
+                            bool isDiffuse = bsdf.NumComponents(BxDFType(
+                                    BSDF_DIFFUSE | BSDF_REFLECTION |
+                                    BSDF_TRANSMISSION)) > 0;
+                            bool isGlossy = bsdf.NumComponents(BxDFType(
+                                    BSDF_GLOSSY | BSDF_REFLECTION |
+                                    BSDF_TRANSMISSION)) > 0;
+                            if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
+                                pixel.vsp = new VisibleSurfacePoint{isect.p, wo, &bsdf, beta};
+                                break;
+                            }
+
+                            // Spawn ray from VolSPPM camera path vertex
+                            if (depth < maxDepth - 1) {
+                                Float pdf;
+                                Vector3f wi;
+                                BxDFType type;
+                                Spectrum f =
+                                        bsdf.Sample_f(wo, &wi, localSampler.Get2D(),
+                                                      &pdf, BSDF_ALL, &type);
+                                if (pdf == 0. || f.IsBlack()) break;
+                                specularBounce = (type & BSDF_SPECULAR) != 0;
+                                beta *= f * AbsDot(wi, isect.shading.n) / pdf;
+                                if (beta.y() < 0.25) {
+                                    Float continueProb =
+                                            std::min((Float)1, beta.y());
+                                    if (localSampler.Get1D() > continueProb) break;
+                                    beta /= continueProb;
+                                }
+                                ray = (RayDifferential)isect.SpawnRay(wi);
+                            }
                         }
+
+
                     }
                 }
             }, nTiles);
@@ -220,8 +313,8 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             Float maxRadius = 0.;
             for (int i = 0; i < nPixels; ++i) {
                 const VolSPPMPixel &pixel = pixels[i];
-                if (pixel.vp.beta.IsBlack()) continue;
-                Bounds3f vpBound = Expand(Bounds3f(pixel.vp.p), pixel.radius);
+                if (pixel.vsp->beta.IsBlack()) continue;
+                Bounds3f vpBound = Expand(Bounds3f(pixel.vsp->p), pixel.radius);
                 gridBounds = Union(gridBounds, vpBound);
                 maxRadius = std::max(maxRadius, pixel.radius);
             }
@@ -238,13 +331,13 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             ParallelFor([&](int pixelIndex) {
                 MemoryArena &arena = perThreadArenas[ThreadIndex];
                 VolSPPMPixel &pixel = pixels[pixelIndex];
-                if (!pixel.vp.beta.IsBlack()) {
+                if (!pixel.vsp->beta.IsBlack()) {
                     // Add pixel's visible point to applicable grid cells
                     Float radius = pixel.radius;
                     Point3i pMin, pMax;
-                    ToGrid(pixel.vp.p - Vector3f(radius, radius, radius),
+                    ToGrid(pixel.vsp->p - Vector3f(radius, radius, radius),
                            gridBounds, gridRes, &pMin);
-                    ToGrid(pixel.vp.p + Vector3f(radius, radius, radius),
+                    ToGrid(pixel.vsp->p + Vector3f(radius, radius, radius),
                            gridBounds, gridRes, &pMax);
                     for (int z = pMin.z; z <= pMax.z; ++z)
                         for (int y = pMin.y; y <= pMax.y; ++y)
@@ -329,14 +422,14 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 ++visiblePointsChecked;
                                 VolSPPMPixel &pixel = *node->pixel;
                                 Float radius = pixel.radius;
-                                if (DistanceSquared(pixel.vp.p, isect.p) >
+                                if (DistanceSquared(pixel.vsp->p, isect.p) >
                                     radius * radius)
                                     continue;
                                 // Update _pixel_ $\Phi$ and $M$ for nearby
                                 // photon
                                 Vector3f wi = -photonRay.d;
                                 Spectrum Phi =
-                                        beta * pixel.vp.bsdf->f(pixel.vp.wo, wi);
+                                        beta * pixel.vsp->bsdf->f(pixel.vsp->wo, wi);
                                 for (int i = 0; i < Spectrum::nSamples; ++i)
                                     pixel.Phi[i].Add(Phi[i]);
                                 ++pixel.M;
@@ -397,7 +490,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     Spectrum Phi;
                     for (int j = 0; j < Spectrum::nSamples; ++j)
                         Phi[j] = p.Phi[j];
-                    p.tau = (p.tau + p.vp.beta * Phi) * (Rnew * Rnew) /
+                    p.tau = (p.tau + p.vsp->beta * Phi) * (Rnew * Rnew) /
                             (p.radius * p.radius);
                     p.N = Nnew;
                     p.radius = Rnew;
@@ -406,8 +499,8 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                         p.Phi[j] = (Float)0;
                 }
                 // Reset _VisiblePoint_ in pixel
-                p.vp.beta = 0.;
-                p.vp.bsdf = nullptr;
+                p.vsp->beta = 0.;
+                p.vsp->bsdf = nullptr;
             }, nPixels, 4096);
         }
 
