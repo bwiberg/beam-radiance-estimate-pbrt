@@ -33,17 +33,12 @@
 
 // integrators/sppm.cpp*
 #include "integrators/vsppm.h"
-#include "parallel.h"
 #include "scene.h"
 #include "imageio.h"
-#include "spectrum.h"
-#include "rng.h"
 #include "paramset.h"
 #include "progressreporter.h"
-#include "interaction.h"
 #include "sampling.h"
 #include "samplers/halton.h"
-#include "stats.h"
 
 namespace pbrt {
 
@@ -64,6 +59,7 @@ STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 struct VisiblePoint {
     // VisiblePoint Public Methods
     VisiblePoint() : bsdf(nullptr), phase(nullptr) {}
+
     Point3f p;
     Vector3f wo;
     const BSDF *bsdf;
@@ -106,7 +102,7 @@ static bool ToGrid(const Point3f &p, const Bounds3f &bounds,
     bool inBounds = true;
     Vector3f pg = bounds.Offset(p);
     for (int i = 0; i < 3; ++i) {
-        (*pi)[i] = (int)(gridRes[i] * pg[i]);
+        (*pi)[i] = (int) (gridRes[i] * pg[i]);
         inBounds &= ((*pi)[i] >= 0 && (*pi)[i] < gridRes[i]);
         (*pi)[i] = Clamp((*pi)[i], 0, gridRes[i] - 1);
     }
@@ -114,8 +110,8 @@ static bool ToGrid(const Point3f &p, const Bounds3f &bounds,
 }
 
 inline unsigned int hash(const Point3i &p, int hashSize) {
-    return (unsigned int)((p.x * 73856093) ^ (p.y * 19349663) ^
-                          (p.z * 83492791)) %
+    return (unsigned int) ((p.x * 73856093) ^ (p.y * 19349663) ^
+                           (p.z * 83492791)) %
            hashSize;
 }
 
@@ -149,6 +145,7 @@ public:
     std::unique_ptr<Sampler> Clone(int seed) override {
         return nullptr;
     }
+
 private:
     RNG rng;
     Sampler &sampler;
@@ -274,7 +271,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             // Process SPPM camera ray medium interaction
                             Vector3f wo = -ray.d;
                             pixel.Ld += beta * UniformSampleOneLight(mi, scene, arena,
-                                                                 localSampler, true);
+                                                                     localSampler, true);
 
                             // Create visible point and end camera path
                             pixel.vp.p = mi.p;
@@ -335,11 +332,11 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 beta *= f * AbsDot(wi, isect.shading.n) / pdf;
                                 if (beta.y() < 0.25) {
                                     Float continueProb =
-                                            std::min((Float)1, beta.y());
+                                            std::min((Float) 1, beta.y());
                                     if (localSampler.Get1D() > continueProb) break;
                                     beta /= continueProb;
                                 }
-                                ray = (RayDifferential)isect.SpawnRay(wi);
+                                ray = (RayDifferential) isect.SpawnRay(wi);
                             }
                         }
                     }
@@ -370,10 +367,10 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             // Compute resolution of SPPM grid in each dimension
             const Vector3f diag = gridBounds.Diagonal();
             const Float maxDiag = MaxComponent(diag);
-            const int baseGridRes = (int)(maxDiag / maxRadius);
+            const int baseGridRes = (int) (maxDiag / maxRadius);
             CHECK_GT(baseGridRes, 0);
             for (int i = 0; i < 3; ++i)
-                gridRes[i] = std::max((int)(baseGridRes * diag[i] / maxDiag), 1);
+                gridRes[i] = std::max((int) (baseGridRes * diag[i] / maxDiag), 1);
 
             // Add visible points to SPPM grid
             ParallelFor([&](int pixelIndex) {
@@ -416,7 +413,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 MemoryArena &arena = photonShootArenas[ThreadIndex];
                 // Follow photon path for _photonIndex_
                 const uint64_t HaltonIndex =
-                        (uint64_t)iter * (uint64_t)photonsPerIteration +
+                        (uint64_t) iter * (uint64_t) photonsPerIteration +
                         photonIndex;
                 AwesomeHaltonSampler localSampler(HaltonIndex);
 
@@ -505,10 +502,10 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             beta * fr * AbsDot(wi, isect.shading.n) / pdf;
 
                     // Possibly terminate photon path with Russian roulette
-                    Float q = std::max((Float)0, 1 - bnew.y() / beta.y());
+                    Float q = std::max((Float) 0, 1 - bnew.y() / beta.y());
                     if (localSampler.Get1D() < q) break;
                     beta = bnew / (1 - q);
-                    photonRay = (RayDifferential)isect.SpawnRay(wi);
+                    photonRay = (RayDifferential) isect.SpawnRay(wi);
                 }
                 arena.Reset();
             }, photonsPerIteration, 8192);
@@ -524,7 +521,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 if (p.M > 0) {
                     // Update pixel photon count, search radius, and $\tau$ from
                     // photons
-                    Float gamma = (Float)2 / (Float)3;
+                    Float gamma = (Float) 2 / (Float) 3;
                     Float Nnew = p.N + gamma * p.M;
                     Float Rnew = p.radius * std::sqrt(Nnew / (p.N + p.M));
                     Spectrum Phi;
@@ -536,7 +533,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     p.radius = Rnew;
                     p.M = 0;
                     for (int j = 0; j < Spectrum::nSamples; ++j)
-                        p.Phi[j] = (Float)0;
+                        p.Phi[j] = (Float) 0;
                 }
                 // Reset _VisiblePoint_ in pixel
                 p.vp.beta = 0.0f;
@@ -549,7 +546,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
         if (iter + 1 == nIterations || ((iter + 1) % writeFrequency) == 0) {
             int x0 = pixelBounds.pMin.x;
             int x1 = pixelBounds.pMax.x;
-            uint64_t Np = (uint64_t)(iter + 1) * (uint64_t)photonsPerIteration;
+            uint64_t Np = (uint64_t) (iter + 1) * (uint64_t) photonsPerIteration;
             std::unique_ptr<Spectrum[]> image(new Spectrum[pixelBounds.Area()]);
             int offset = 0;
             for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
@@ -603,7 +600,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
 }
 
 Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
-                                 std::shared_ptr<const Camera> camera) {
+                                    std::shared_ptr<const Camera> camera) {
     int nIterations =
             params.FindOneInt("iterations",
                               params.FindOneInt("numiterations", 64));
@@ -612,8 +609,18 @@ Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
     int writeFreq = params.FindOneInt("imagewritefrequency", 1 << 31);
     Float radius = params.FindOneFloat("radius", 1.f);
     if (PbrtOptions.quickRender) nIterations = std::max(1, nIterations / 16);
+    std::string photonTypeStr = params.FindOneString("photontype", "point");
+    PhotonType photonType = PhotonType::POINT;
+    if (photonTypeStr.compare("point") == 0)
+        photonType = PhotonType::POINT;
+    else if (photonTypeStr.compare("beam") == 0)
+        photonType = PhotonType::BEAM;
+    else
+        Error("Expected photontype as \"point\" or \"beam\", got %s. Defaulting to \"point\"", photonTypeStr.c_str());
+
     return new VolSPPMIntegrator(camera, nIterations, photonsPerIter, maxDepth,
-                              radius, writeFreq);
+                                 radius, writeFreq,
+                                 photonType);
 }
 
 }  // namespace pbrt

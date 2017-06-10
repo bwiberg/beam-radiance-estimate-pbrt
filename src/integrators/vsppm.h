@@ -18,13 +18,19 @@
 
 namespace pbrt {
 
+enum class PhotonType {
+    POINT = 0,
+    BEAM = 1
+};
+
 // SPPM Declarations
 class VolSPPMIntegrator : public Integrator {
 public:
     // VolSPPMIntegrator Public Methods
     VolSPPMIntegrator(std::shared_ptr<const Camera> &camera, int nIterations,
                       int photonsPerIteration, int maxDepth,
-                      Float initialSearchRadius, int writeFrequency)
+                      Float initialSearchRadius, int writeFrequency,
+                      PhotonType photonType)
             : camera(camera),
               initialSearchRadius(initialSearchRadius),
               nIterations(nIterations),
@@ -32,7 +38,8 @@ public:
               photonsPerIteration(photonsPerIteration > 0
                                   ? photonsPerIteration
                                   : camera->film->croppedPixelBounds.Area()),
-              writeFrequency(writeFrequency) {}
+              writeFrequency(writeFrequency),
+              photonType(photonType){}
 
     void Render(const Scene &scene);
 
@@ -44,6 +51,8 @@ private:
     const int maxDepth;
     const int photonsPerIteration;
     const int writeFrequency;
+
+    const PhotonType photonType;
 };
 
 Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
