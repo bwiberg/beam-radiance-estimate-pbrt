@@ -46,6 +46,12 @@
 
 namespace pbrt {
 struct PhotonBeam {
+    PhotonBeam(Point3f const &start, Point3f const &end,
+               Float radius, Spectrum const &power)
+            : start(start), end(end),
+              radius(radius),
+              power(power) {}
+
     Point3f start, end;
     Float radius;
     Spectrum power;

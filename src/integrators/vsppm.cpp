@@ -39,6 +39,8 @@
 #include "progressreporter.h"
 #include "sampling.h"
 #include "samplers/halton.h"
+#include "core/photonbeambvh.h"
+#include <base/mutex.h> // from glog
 
 namespace pbrt {
 
@@ -60,65 +62,132 @@ STAT_INT_DISTRIBUTION(
 STAT_MEMORY_COUNTER("Memory/SPPM Pixels", pixelMemoryBytes);
 STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 
-struct VisiblePoint {
-    // VisiblePoint Public Methods
-    VisiblePoint() : bsdf(nullptr), phase(nullptr) {}
-
-    Point3f p;
-    Vector3f wo;
-    const BSDF *bsdf;
-    const PhaseFunction *phase;
-    Spectrum beta;
-
-    bool IsSurfacePoint() const {
-//        CHECK((bsdf && !phase) || (!bsdf && phase));
-        if (bsdf) CHECK(!phase);
-        return bsdf != nullptr;
-    }
-
-    bool IsMediumPoint() const {
-//        CHECK((bsdf && !phase) || (!bsdf && phase));
-        if (phase) CHECK(!bsdf);
-        return phase != nullptr;
-    }
-};
-
 // SPPM Local Definitions
-struct SPPMPixel {
-    // SPPMPixel Public Methods
-    SPPMPixel() : M(0) {}
+struct VolSPPMPixel {
+    // VolSPPMPixel Public Methods
+    VolSPPMPixel() : M(0) {}
 
-    // SPPMPixel Public Data
+    // VolSPPMPixel Public Data
     Float radius = 0;
     Spectrum Ld;
-    VisiblePoint vp;
     AtomicFloat Phi[Spectrum::nSamples];
     std::atomic<int> M;
     Float N = 0;
     Spectrum tau;
 };
 
-struct SPPMPixelListNode {
-    SPPMPixel *pixel;
-    SPPMPixelListNode *next;
+struct VolSPPMPixelListNode {
+    VolSPPMPixel *pixel;
+    VolSPPMPixelListNode *next;
 };
 
-static bool ToGrid(const Point3f &p, const Bounds3f &bounds,
-                   const int gridRes[3], Point3i *pi) {
-    bool inBounds = true;
-    Vector3f pg = bounds.Offset(p);
-    for (int i = 0; i < 3; ++i) {
-        (*pi)[i] = (int) (gridRes[i] * pg[i]);
-        inBounds &= ((*pi)[i] >= 0 && (*pi)[i] < gridRes[i]);
-        (*pi)[i] = Clamp((*pi)[i], 0, gridRes[i] - 1);
-    }
-    return inBounds;
+Float Determinant(const Vector3f &a, const Vector3f &b, const Vector3f &c) {
+    // a b c
+    // d e f
+    // g h i
+    return a.x * b.y * c.z + a.y * b.z * c.x + a.z * b.x * c.y
+        - (a.z * b.y * c.x + a.y * b.x * c.z + a.x * b.z * c.y);
 }
 
-inline unsigned int hash(const Point3i &p, int hashSize) {
-    return (unsigned int) ((p.x * 73856093) ^ (p.y * 19349663) ^
-                           (p.z * 83492791)) %
-           hashSize;
+bool ComputeClosestPoints(const Point3f &a0, const Point3f &a1,
+                          const Point3f &b0, const Point3f &b1,
+                          Point3f &aClosest, Point3f &bClosest) {
+    Vector3f A = a1 - a0;
+    Vector3f B = b1 - b0;
+    Float magA = A.Length();
+    Float magB = B.Length();
+
+    if (magA == 0.0f) {
+        aClosest = a0;
+        if (magB == 0.0f) {
+            bClosest = b0;
+            return true;
+        }
+        // Line segment A is a point, project A on B and clamp to end points
+        B /= magB;
+
+        A = a0 - b0;
+        Float dot = Dot(A, B);
+        bClosest = b0 + B * Clamp(dot, 0.0f, magB);
+
+        return true;
+    } else if (magB == 0.0f) {
+        bClosest = b0;
+        // Line segment B is a point, project B on A and clamp to end points
+        A /= magA;
+
+        B = b0 - a0;
+        Float dot = Dot(A, B);
+        aClosest = a0 + A * Clamp(dot, 0.0f, magA);
+
+        return true;
+    }
+
+    A /= magA;
+    B /= magB;
+
+    const Vector3f cross = Cross(A, B);
+    const Float denom = cross.LengthSquared();
+
+    // If lines are parallel (denom=0) test if lines overlap.
+    // If they don't overlap then there is a closest point solution.
+    // If they do overlap, there are infinite closest positions,
+    // but there is a closest distance
+    if (denom == Float(0.0f)) {
+        Float d0 = Dot(A, b0 - a0);
+        Float d1 = Dot(A, b1 - a0);
+
+        //# Is segment B before A?
+        if (d0 <= 0 && d1 <= 0) {
+            if (fabs(d0) < fabs(d1)) {
+                aClosest = a0;
+                bClosest = b1;
+            }
+            aClosest = a0;
+            bClosest = b1;
+        }
+
+        // Is segment B after A?
+        else if (d0 >= magA && d1 >= magA) {
+            if (fabs(d0) < fabs(d1)) {
+                aClosest = a1;
+                bClosest = b1;
+            }
+            aClosest = a1;
+            bClosest = b1;
+        }
+
+        return false;
+    }
+
+    // Lines criss-cross: Calculate the projected closest points
+    const Vector3f t = b0 - a0;
+    const Float detA = Determinant(t, B, cross);
+    const Float detB = Determinant(t, A, cross);
+
+    const Float t0 = detA / denom;
+    const Float t1 = detB / denom;
+
+    Point3f pA = a0 + A * t0;
+    Point3f pB = b0 + B * t1;
+
+    if (t0 < 0) pA = a0;
+    else if (t0 > magA) pA = a1;
+
+    // clamp projection of A
+    if (t0 < 0 || t0 > magA) {
+        Float dot = Clamp(Dot(B, pA - b0), 0.0f, magB);
+        pB = b0 + B * dot;
+    }
+
+    if (t1 < 0 || t1 > magB) {
+        Float dot = Clamp(Dot(A, pB - a0), 0.0f, magA);
+        pA = a0 + A * dot;
+    }
+
+    aClosest = pA;
+    bClosest = pB;
+    return true;
 }
 
 class AwesomeSampler : public Sampler {
@@ -175,15 +244,86 @@ public:
         return Point2f(Get1D(), Get1D());
     }
 
+    void Reset(uint64_t haltonIndex) {
+        HaltonIndex = haltonIndex;
+        haltonDim = 0;
+        rng = RNG(haltonIndex);
+    }
+
     std::unique_ptr<Sampler> Clone(int seed) override {
         return nullptr;
     }
 
 private:
-    const uint64_t HaltonIndex;
+    uint64_t HaltonIndex;
     uint32_t haltonDim;
     RNG rng;
 };
+
+void TracePhotonRayRecursive(Ray photonRay, int depth, Spectrum beta,
+                             Sampler &localSampler, const Scene &scene,
+                             const int MaxDepth, MemoryArena &arena, const Float BeamRadius,
+                             std::vector<std::shared_ptr<PhotonBeam>> &localPhotonBeams) {
+    SurfaceInteraction isect;
+    for (; depth < MaxDepth; ++depth) {
+        if (!scene.Intersect(photonRay, &isect)) break;
+
+        MediumInteraction mi;
+        Spectrum betaMedium(1.0f);
+        if (photonRay.medium) betaMedium = photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
+        if (beta.IsBlack()) break;
+
+        // Handle an interaction with a medium or a surface
+        if (mi.IsValid()) {
+            ++totalPhotonMediumInteractions;
+
+            // Sample new photon ray direction from volume
+            Vector3f wo = -photonRay.d, wi;
+            mi.phase->Sample_p(wo, &wi, localSampler.Get2D());
+            Ray mediumScatteredRay = mi.SpawnRay(wi);
+
+            Spectrum scatteredBeta = beta * photonRay.medium->Tr(photonRay, localSampler);
+            TracePhotonRayRecursive(mediumScatteredRay, depth + 1, scatteredBeta,
+                                    localSampler, scene,
+                                    MaxDepth, arena, BeamRadius,
+                                    localPhotonBeams);
+
+        }
+
+        ++totalPhotonSurfaceInteractions;
+        auto beam = std::make_shared<PhotonBeam>(photonRay.o, isect.p, BeamRadius, beta);
+        localPhotonBeams.push_back(beam);
+        // Sample new photon ray direction from surface
+
+        // Compute BSDF at photon intersection point
+        isect.ComputeScatteringFunctions(photonRay, arena, true,
+                                         TransportMode::Importance);
+        if (!isect.bsdf) {
+            --depth;
+            photonRay = isect.SpawnRay(photonRay.d);
+            continue;
+        }
+        const BSDF &isectBSDF = *isect.bsdf;
+
+        // Sample BSDF _fr_ and direction _wi_ for reflected photon
+        Vector3f wo = -photonRay.d, wi;
+        Float pdf;
+        BxDFType flags;
+
+        // Generate _bsdfSample_ for outgoing photon sample
+        Spectrum fr = isectBSDF.Sample_f(wo, &wi, localSampler.Get2D(), &pdf,
+                                          BSDF_ALL, &flags);
+        if (fr.IsBlack() || pdf == 0.f) break;
+        Spectrum betaNew = betaMedium * beta * fr * AbsDot(wi, isect.shading.n) / pdf;
+
+        photonRay = (RayDifferential) isect.SpawnRay(wi);
+
+        // Possibly terminate photon path with Russian roulette
+        Float q = std::max((Float) 0, 1 - betaNew.y() / beta.y());
+        if (localSampler.Get1D() < q) break;
+        beta = betaNew / (1 - q);
+    }
+}
 
 // SPPM Method Definitions
 void VolSPPMIntegrator::Render(const Scene &scene) {
@@ -191,10 +331,10 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
     // Initialize _pixelBounds_ and _pixels_ array for SPPM
     Bounds2i pixelBounds = camera->film->croppedPixelBounds;
     int nPixels = pixelBounds.Area();
-    std::unique_ptr<SPPMPixel[]> pixels(new SPPMPixel[nPixels]);
+    std::unique_ptr<VolSPPMPixel[]> pixels(new VolSPPMPixel[nPixels]);
     for (int i = 0; i < nPixels; ++i) pixels[i].radius = initialSearchRadius;
     const Float invSqrtSPP = 1.f / std::sqrt(nIterations);
-    pixelMemoryBytes = nPixels * sizeof(SPPMPixel);
+    pixelMemoryBytes = nPixels * sizeof(VolSPPMPixel);
     // Compute _lightDistr_ for sampling lights proportional to power
     std::unique_ptr<Distribution1D> lightDistr =
             ComputeLightPowerDistribution(scene);
@@ -212,17 +352,96 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
     // Counter to extend HaltonSampler values beyond 1000
     uint64_t globalNumPixels = 0;
 
+    Float currentBeamRadius = 5.0f;
     for (int iter = 0; iter < nIterations; ++iter) {
         // Counter to extend HaltonSampler values beyond 1000
         uint32_t iterNumPixels = 0;
 
-        // Generate VolSPPM visible points
+        std::vector<std::shared_ptr<PhotonBeam>> photonBeams;
+
+        // Trace photons and accumulate contributions
+        {
+            ProfilePhase _(Prof::SPPMPhotonPass);
+            std::vector<MemoryArena> photonShootArenas(MaxThreadIndex());
+            const int NumTasks = 1; //NumSystemCores();
+
+            const int ChunkSize = photonsPerIteration / NumTasks;
+            const int Remainder = photonsPerIteration - ChunkSize * NumTasks;
+            std::vector<std::vector<std::shared_ptr<PhotonBeam>>> localPhotonBeamVector(NumTasks);
+
+            ParallelFor([&](const uint32_t TaskIndex) {
+                MemoryArena &arena = photonShootArenas[ThreadIndex];
+
+                std::vector<std::shared_ptr<PhotonBeam>> &localPhotonBeams = localPhotonBeamVector[TaskIndex];
+                const uint32_t PhotonStartIndex = ChunkSize * TaskIndex;
+
+                int localChunkSize = ChunkSize;
+                if (TaskIndex + 1 == NumTasks) localChunkSize += Remainder;
+
+                for (uint32_t photonIndex = PhotonStartIndex;
+                     photonIndex < PhotonStartIndex + localChunkSize; ++photonIndex) {
+                    // Follow photon path for _photonIndex_
+                    const uint64_t HaltonIndex =
+                            (uint64_t) iter * (uint64_t) photonsPerIteration +
+                            photonIndex;
+                    AwesomeHaltonSampler localSampler(HaltonIndex+1);
+                    std::vector<Float> samples;
+                    for (uint32_t i = 0; i < 1000; ++i) samples.push_back(localSampler.Get1D());
+
+                    // Choose light to shoot photon from
+                    Float lightPdf;
+                    Float lightSample = localSampler.Get1D();
+                    int lightNum =
+                            lightDistr->SampleDiscrete(lightSample, &lightPdf);
+                    const std::shared_ptr<Light> &light = scene.lights[lightNum];
+
+                    // Compute sample values for photon ray leaving light source
+                    Point2f uLight0 = localSampler.Get2D();
+                    Point2f uLight1 = localSampler.Get2D();
+                    Float uLightTime = localSampler.Get1D();
+
+                    // Generate _photonRay_ from light source and initialize _beta_
+                    RayDifferential photonRay;
+                    Normal3f nLight;
+                    Float pdfPos, pdfDir;
+                    Spectrum Le =
+                            light->Sample_Le(uLight0, uLight1, uLightTime, &photonRay,
+                                             &nLight, &pdfPos, &pdfDir);
+                    if (pdfPos == 0 || pdfDir == 0 || Le.IsBlack()) continue;
+                    Spectrum beta = (AbsDot(nLight, photonRay.d) * Le) /
+                                    (lightPdf * pdfPos * pdfDir);
+                    if (beta.IsBlack()) continue;
+                    TracePhotonRayRecursive(photonRay, 0, beta,
+                                            localSampler, scene,
+                                            maxDepth, arena, currentBeamRadius,
+                                            localPhotonBeams);
+                    arena.Reset();
+                }
+            }, NumTasks, 1);
+            progress.Update();
+            photonPaths += photonsPerIteration;
+
+            // Merge local photon beams into global
+            long size = 0;
+            for (auto &localPhotonBeams : localPhotonBeamVector)
+                size += localPhotonBeams.size();
+            photonBeams.reserve(size);
+            for (auto &localPhotonBeams : localPhotonBeamVector) {
+                for (uint32_t i = 0; i < localPhotonBeams.size(); ++i)
+                    photonBeams.push_back(localPhotonBeams[i]);
+                localPhotonBeams.erase(localPhotonBeams.begin(),
+                                       localPhotonBeams.end());
+            }
+        }
+        PhotonBeamBVH photonBeamBVH(photonBeams);
+
+        // Cast camera rays and gather contributions from photon beams
         std::vector<MemoryArena> perThreadArenas(MaxThreadIndex());
         {
             ProfilePhase _(Prof::SPPMCameraPass);
             ParallelFor2D([&](Point2i tile) {
                 MemoryArena &arena = perThreadArenas[ThreadIndex];
-                // Follow camera paths for _tile_ in image for VolSPPM
+                // Follow camera paths for _tile_ in im age for VolSPPM
                 const int TileIndex = tile.y * nTiles.x + tile.x;
                 std::unique_ptr<Sampler> tileSampler = sampler.Clone(TileIndex);
                 // Compute _tileBounds_ for VolSPPM tile
@@ -248,14 +467,12 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             camera->GenerateRayDifferential(cameraSample, &ray);
                     ray.ScaleDifferentials(invSqrtSPP);
 
-                    // Follow camera ray path until a visible point is created
-
-                    // Get _SPPMPixel_ for _pPixel_
+                    // Get _VolSPPMPixel_ for _pPixel_
                     Point2i pPixelO = Point2i(pPixel - pixelBounds.pMin);
                     int pixelOffset =
                             pPixelO.x +
                             pPixelO.y * (pixelBounds.pMax.x - pixelBounds.pMin.x);
-                    SPPMPixel &pixel = pixels[pixelOffset];
+                    VolSPPMPixel &pixel = pixels[pixelOffset];
                     bool specularBounce = false;
                     for (int depth = 0; depth < maxDepth; ++depth) {
                         SurfaceInteraction isect;
@@ -267,64 +484,45 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             break;
                         }
 
-                        MediumInteraction mi;
-                        if (ray.medium) beta *= ray.medium->Sample(ray, localSampler, arena, &mi);
-                        if (beta.IsBlack()) break;
+                        ++totalPhotonSurfaceInteractions;
 
-                        // Handle an interaction with a medium or a surface
-                        if (mi.IsValid()) {
-                            ++totalPhotonMediumInteractions;
-                            // Process SPPM camera ray medium interaction
-                            Vector3f wo = -ray.d;
-                            pixel.Ld += beta * UniformSampleOneLight(mi, scene, arena,
-                                                                     localSampler, true);
+                        Spectrum mediumBeta(1.0f);
+                        if (ray.medium) mediumBeta = ray.medium->Tr(ray, localSampler);
 
-                            // Create visible point and end camera path
-                            pixel.vp.p = mi.p;
-                            pixel.vp.wo = wo;
-                            pixel.vp.bsdf = nullptr;
-                            pixel.vp.phase = mi.phase;
-                            pixel.vp.beta = beta;
-                            ++totalVisibleMediumPoints;
-                            break;
-
-                        } else {
-                            ++totalPhotonSurfaceInteractions;
-                            // Process SPPM camera ray surface intersection
-
-                            // Compute BSDF at SPPM camera ray intersection
-                            isect.ComputeScatteringFunctions(ray, arena, true);
-                            if (!isect.bsdf) {
-                                ray = isect.SpawnRay(ray.d);
-                                --depth;
-                                continue;
+                        std::vector<std::shared_ptr<PhotonBeam>> beams = photonBeamBVH.Intersect(ray);
+                        for (std::shared_ptr<PhotonBeam> const& beam : beams) {
+                            // Add contribution of photon beam along camera ray
+                            Point3f rayClose, beamClose;
+                            if (ComputeClosestPoints(ray.o, isect.p, beam->start, beam->end, rayClose, beamClose)) {
+                                const Float MaxDistance = currentBeamRadius + beam->radius;
+                                Float distance = (rayClose - beamClose).Length();
+                                if (distance < MaxDistance) {
+                                    Float r = distance / MaxDistance;
+                                    pixel.Ld += 1e-5 * beam->power * sqrt(1.0f - r * r);
+                                }
                             }
+                        }
+
+                        beta *= mediumBeta;
+
+                        // Process SPPM camera ray surface intersection
+                        // Compute BSDF at SPPM camera ray intersection
+                        isect.ComputeScatteringFunctions(ray, arena, true);
+                        if (!isect.bsdf) {
+                            ray = isect.SpawnRay(ray.d);
+                            --depth;
+                        } else {
                             const BSDF &bsdf = *isect.bsdf;
 
                             // Accumulate direct illumination at SPPM camera ray
                             // intersection
                             Vector3f wo = -ray.d;
-                            if (depth == 0 || specularBounce)
-                                pixel.Ld += beta * isect.Le(wo);
-                            pixel.Ld +=
-                                    beta * UniformSampleOneLight(isect, scene, arena,
-                                                                 localSampler, true);
-
-                            // Possibly create visible point and end camera path
-                            bool isDiffuse = bsdf.NumComponents(BxDFType(
-                                    BSDF_DIFFUSE | BSDF_REFLECTION |
-                                    BSDF_TRANSMISSION)) > 0;
-                            bool isGlossy = bsdf.NumComponents(BxDFType(
-                                    BSDF_GLOSSY | BSDF_REFLECTION |
-                                    BSDF_TRANSMISSION)) > 0;
-                            if (isDiffuse || (isGlossy && depth == maxDepth - 1)) {
-                                pixel.vp.p = isect.p;
-                                pixel.vp.wo = wo;
-                                pixel.vp.bsdf = isect.bsdf;
-                                pixel.vp.phase = nullptr;
-                                pixel.vp.beta = beta;
-                                ++totalVisibleSurfacePoints;
-                                break;
+                            if (renderSurfaces) {
+                                if (depth == 0 || specularBounce)
+                                    pixel.Ld += beta * isect.Le(wo);
+                                pixel.Ld +=
+                                        beta * UniformSampleOneLight(isect, scene, arena,
+                                                                     localSampler, true);
                             }
 
                             // Spawn ray from SPPM camera path vertex
@@ -338,14 +536,15 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                 if (pdf == 0. || f.IsBlack()) break;
                                 specularBounce = (type & BSDF_SPECULAR) != 0;
                                 beta *= f * AbsDot(wi, isect.shading.n) / pdf;
-                                if (beta.y() < 0.25) {
-                                    Float continueProb =
-                                            std::min((Float) 1, beta.y());
-                                    if (localSampler.Get1D() > continueProb) break;
-                                    beta /= continueProb;
-                                }
                                 ray = (RayDifferential) isect.SpawnRay(wi);
                             }
+                        }
+
+                        if (beta.y() < 0.25) {
+                            Float continueProb =
+                                    std::min((Float) 1, beta.y());
+                            if (localSampler.Get1D() > continueProb) break;
+                            beta /= continueProb;
                         }
                     }
                 }
@@ -353,225 +552,14 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
         }
         progress.Update();
 
-        // Create grid of all SPPM visible points
-        int gridRes[3];
-        Bounds3f gridBounds;
-        // Allocate grid for SPPM visible points
-        const int hashSize = nPixels;
-        std::vector<std::atomic<SPPMPixelListNode *>> grid(hashSize);
-        {
-            ProfilePhase _(Prof::SPPMGridConstruction);
-
-            // Compute grid bounds for SPPM visible points
-            Float maxRadius = 0.;
-            for (int i = 0; i < nPixels; ++i) {
-                const SPPMPixel &pixel = pixels[i];
-                if (pixel.vp.beta.IsBlack()) continue;
-                Bounds3f vpBound = Expand(Bounds3f(pixel.vp.p), pixel.radius);
-                gridBounds = Union(gridBounds, vpBound);
-                maxRadius = std::max(maxRadius, pixel.radius);
-            }
-
-            // Compute resolution of SPPM grid in each dimension
-            const Vector3f diag = gridBounds.Diagonal();
-            const Float maxDiag = MaxComponent(diag);
-            const int baseGridRes = (int) (maxDiag / maxRadius);
-            CHECK_GT(baseGridRes, 0);
-            for (int i = 0; i < 3; ++i)
-                gridRes[i] = std::max((int) (baseGridRes * diag[i] / maxDiag), 1);
-
-            // Add visible points to SPPM grid
-            ParallelFor([&](int pixelIndex) {
-                MemoryArena &arena = perThreadArenas[ThreadIndex];
-                SPPMPixel &pixel = pixels[pixelIndex];
-                if (!pixel.vp.beta.IsBlack()) {
-                    // Add pixel's visible point to applicable grid cells
-                    Float radius = pixel.radius;
-                    Point3i pMin, pMax;
-                    ToGrid(pixel.vp.p - Vector3f(radius, radius, radius),
-                           gridBounds, gridRes, &pMin);
-                    ToGrid(pixel.vp.p + Vector3f(radius, radius, radius),
-                           gridBounds, gridRes, &pMax);
-                    for (int z = pMin.z; z <= pMax.z; ++z)
-                        for (int y = pMin.y; y <= pMax.y; ++y)
-                            for (int x = pMin.x; x <= pMax.x; ++x) {
-                                // Add visible point to grid cell $(x, y, z)$
-                                int h = hash(Point3i(x, y, z), hashSize);
-                                SPPMPixelListNode *node =
-                                        arena.Alloc<SPPMPixelListNode>();
-                                node->pixel = &pixel;
-
-                                // Atomically add _node_ to the start of
-                                // _grid[h]_'s linked list
-                                node->next = grid[h];
-                                while (!grid[h].compare_exchange_weak(node->next, node));
-                            }
-                    ReportValue(gridCellsPerVisiblePoint,
-                                (1 + pMax.x - pMin.x) * (1 + pMax.y - pMin.y) *
-                                (1 + pMax.z - pMin.z));
-                }
-            }, nPixels, 4096);
-        }
-
-        // Trace photons and accumulate contributions
-        {
-            ProfilePhase _(Prof::SPPMPhotonPass);
-            std::vector<MemoryArena> photonShootArenas(MaxThreadIndex());
-            ParallelFor([&](int photonIndex) {
-                MemoryArena &arena = photonShootArenas[ThreadIndex];
-                // Follow photon path for _photonIndex_
-                const uint64_t HaltonIndex =
-                        (uint64_t) iter * (uint64_t) photonsPerIteration +
-                        photonIndex;
-                AwesomeHaltonSampler localSampler(HaltonIndex);
-
-                // Choose light to shoot photon from
-                Float lightPdf;
-                Float lightSample = localSampler.Get1D();
-                int lightNum =
-                        lightDistr->SampleDiscrete(lightSample, &lightPdf);
-                const std::shared_ptr<Light> &light = scene.lights[lightNum];
-
-                // Compute sample values for photon ray leaving light source
-                Point2f uLight0 = localSampler.Get2D();
-                Point2f uLight1 = localSampler.Get2D();
-                Float uLightTime = localSampler.Get1D();
-
-                // Generate _photonRay_ from light source and initialize _beta_
-                RayDifferential photonRay;
-                Normal3f nLight;
-                Float pdfPos, pdfDir;
-                Spectrum Le =
-                        light->Sample_Le(uLight0, uLight1, uLightTime, &photonRay,
-                                         &nLight, &pdfPos, &pdfDir);
-                if (pdfPos == 0 || pdfDir == 0 || Le.IsBlack()) return;
-                Spectrum beta = (AbsDot(nLight, photonRay.d) * Le) /
-                                (lightPdf * pdfPos * pdfDir);
-                if (beta.IsBlack()) return;
-
-                // Follow photon path through scene and record intersections
-                SurfaceInteraction isect;
-                for (int depth = 0; depth < maxDepth; ++depth) {
-                    if (!scene.Intersect(photonRay, &isect)) break;
-
-                    MediumInteraction mi;
-                    if (photonRay.medium) beta *= photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
-                    if (beta.IsBlack()) break;
-
-                    // Handle an interaction with a medium or a surface
-                    Spectrum bnew;
-                    Vector3f newWi;
-                    if (mi.IsValid()) {
-                        ++totalPhotonMediumInteractions;
-
-                        // TODO should I only add contrib if depth > 0?
-                        Point3i photonGridIndex;
-                        if (ToGrid(isect.p, gridBounds, gridRes,
-                                   &photonGridIndex)) {
-                            int h = hash(photonGridIndex, hashSize);
-                            // Add photon contribution to visible points in
-                            // _grid[h]_
-                            for (SPPMPixelListNode *node =
-                                    grid[h].load(std::memory_order_relaxed);
-                                 node != nullptr; node = node->next) {
-                                ++visiblePointsChecked;
-                                SPPMPixel &pixel = *node->pixel;
-                                if (!pixel.vp.IsMediumPoint()) continue;
-                                Float radius = pixel.radius;
-                                if (DistanceSquared(pixel.vp.p, isect.p) >
-                                    radius * radius)
-                                    continue;
-                                // Update _pixel_ $\Phi$ and $M$ for nearby
-                                // photon
-                                Vector3f wi = -photonRay.d;
-                                Spectrum Phi = beta * pixel.vp.phase->p(pixel.vp.wo, wi);
-                                for (int i = 0; i < Spectrum::nSamples; ++i)
-                                    pixel.Phi[i].Add(Phi[i]);
-                                ++pixel.M;
-                            }
-
-                            // Sample new photon ray direction from volume
-                            Vector3f wo = -photonRay.d;
-                            mi.phase->Sample_p(wo, &newWi, localSampler.Get2D());
-                            photonRay = mi.SpawnRay(newWi);
-                        }
-
-                    } else {
-                        ++totalPhotonSurfaceInteractions;
-                        if (depth > 0) {
-                            // Add photon contribution to nearby visible points
-                            Point3i photonGridIndex;
-                            if (ToGrid(isect.p, gridBounds, gridRes,
-                                       &photonGridIndex)) {
-                                int h = hash(photonGridIndex, hashSize);
-                                // Add photon contribution to visible points in
-                                // _grid[h]_
-                                for (SPPMPixelListNode *node =
-                                        grid[h].load(std::memory_order_relaxed);
-                                     node != nullptr; node = node->next) {
-                                    ++visiblePointsChecked;
-                                    SPPMPixel &pixel = *node->pixel;
-                                    if (!pixel.vp.IsSurfacePoint()) continue;
-                                    Float radius = pixel.radius;
-                                    if (DistanceSquared(pixel.vp.p, isect.p) >
-                                        radius * radius)
-                                        continue;
-                                    // Update _pixel_ $\Phi$ and $M$ for nearby
-                                    // photon
-                                    Vector3f wi = -photonRay.d;
-                                    Spectrum Phi =
-                                            beta * pixel.vp.bsdf->f(pixel.vp.wo, wi);
-                                    for (int i = 0; i < Spectrum::nSamples; ++i)
-                                        pixel.Phi[i].Add(Phi[i]);
-                                    ++pixel.M;
-                                }
-                            }
-                        }
-                        // Sample new photon ray direction from surface
-
-                        // Compute BSDF at photon intersection point
-                        isect.ComputeScatteringFunctions(photonRay, arena, true,
-                                                         TransportMode::Importance);
-                        if (!isect.bsdf) {
-                            --depth;
-                            photonRay = isect.SpawnRay(photonRay.d);
-                            continue;
-                        }
-                        const BSDF &photonBSDF = *isect.bsdf;
-
-                        // Sample BSDF _fr_ and direction _wi_ for reflected photon
-                        Vector3f wo = -photonRay.d;
-                        Float pdf;
-                        BxDFType flags;
-
-                        // Generate _bsdfSample_ for outgoing photon sample
-                        Point2f bsdfSample = localSampler.Get2D();
-                        Spectrum fr = photonBSDF.Sample_f(wo, &newWi, bsdfSample, &pdf,
-                                                          BSDF_ALL, &flags);
-                        if (fr.IsBlack() || pdf == 0.f) break;
-                        bnew = beta * fr * AbsDot(newWi, isect.shading.n) / pdf;
-
-                        photonRay = (RayDifferential) isect.SpawnRay(newWi);
-                    }
-
-                    // Possibly terminate photon path with Russian roulette
-                    Float q = std::max((Float) 0, 1 - bnew.y() / beta.y());
-                    if (localSampler.Get1D() < q) break;
-                    beta = bnew / (1 - q);
-                }
-                arena.Reset();
-            }, photonsPerIteration, 8192);
-            progress.Update();
-            photonPaths += photonsPerIteration;
-        }
+        currentBeamRadius = 0.992f * currentBeamRadius;
 
         // Update pixel values from this pass's photons
         {
             ProfilePhase _(Prof::SPPMStatsUpdate);
             ParallelFor([&](int i) {
-                SPPMPixel &p = pixels[i];
-                if (((p.vp.IsSurfacePoint() && renderSurfaces) ||
-                    (p.vp.IsMediumPoint() && renderMedia)) && p.M > 0) {
+                VolSPPMPixel &p = pixels[i];
+                if (p.M > 0) {
                     // Update pixel photon count, search radius, and $\tau$ from
                     // photons
                     Float gamma = (Float) 2 / (Float) 3;
@@ -580,7 +568,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     Spectrum Phi;
                     for (int j = 0; j < Spectrum::nSamples; ++j)
                         Phi[j] = p.Phi[j];
-                    p.tau = (p.tau + p.vp.beta * Phi) * (Rnew * Rnew) /
+                    p.tau = (p.tau + Phi) * (Rnew * Rnew) /
                             (p.radius * p.radius);
                     p.N = Nnew;
                     p.radius = Rnew;
@@ -588,10 +576,6 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     for (int j = 0; j < Spectrum::nSamples; ++j)
                         p.Phi[j] = (Float) 0;
                 }
-                // Reset _VisiblePoint_ in pixel
-                p.vp.beta = 0.0f;
-                p.vp.bsdf = nullptr;
-                p.vp.phase = nullptr;
             }, nPixels, 4096);
         }
 
@@ -605,7 +589,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                 for (int x = x0; x < x1; ++x) {
                     // Compute radiance _L_ for SPPM pixel _pixel_
-                    const SPPMPixel &pixel =
+                    const VolSPPMPixel &pixel =
                             pixels[(y - pixelBounds.pMin.y) * (x1 - x0) + (x - x0)];
 
                     // Contribute only if visible point should be rendered or not
@@ -623,7 +607,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 Float minrad = 1e30f, maxrad = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const SPPMPixel &p =
+                        const VolSPPMPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         minrad = std::min(minrad, p.radius);
@@ -636,7 +620,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 int offset = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const SPPMPixel &p =
+                        const VolSPPMPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         Float v = 1.f - (p.radius - minrad) / (maxrad - minrad);
@@ -647,7 +631,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 }
                 Point2i res(pixelBounds.pMax.x - pixelBounds.pMin.x,
                             pixelBounds.pMax.y - pixelBounds.pMin.y);
-                WriteImage("sppm_radius.png", rimg.get(), pixelBounds, res);
+                WriteImage("sppm_radius.exr", rimg.get(), pixelBounds, res);
             }
         }
     }
