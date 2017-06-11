@@ -149,6 +149,7 @@ INCLUDE_DIRECTORIES (
 
 SET ( PBRT_CORE_SOURCE
   src/core/api.cpp
+        src/core/photonbeambvh.cpp
   src/core/bssrdf.cpp
   src/core/camera.cpp
   src/core/efloat.cpp
@@ -189,6 +190,7 @@ SET ( PBRT_CORE_SOURCE
 
 SET ( PBRT_CORE_HEADERS
   src/core/api.h
+  src/core/photonbeambvh.h
   src/core/bssrdf.h
   src/core/camera.h
   src/core/efloat.h
