@@ -71,12 +71,14 @@ struct VisiblePoint {
     Spectrum beta;
 
     bool IsSurfacePoint() const {
-        CHECK((bsdf && !phase) || (!bsdf && phase));
+//        CHECK((bsdf && !phase) || (!bsdf && phase));
+        if (bsdf) CHECK(!phase);
         return bsdf != nullptr;
     }
 
     bool IsMediumPoint() const {
-        CHECK((bsdf && !phase) || (!bsdf && phase));
+//        CHECK((bsdf && !phase) || (!bsdf && phase));
+        if (phase) CHECK(!bsdf);
         return phase != nullptr;
     }
 };
