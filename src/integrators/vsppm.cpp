@@ -268,6 +268,8 @@ void TracePhotonRayRecursive(Ray photonRay, int depth, Spectrum beta,
     for (; depth < MaxDepth; ++depth) {
         if (!scene.Intersect(photonRay, &isect)) break;
 
+        Spectrum betaStart;
+
         MediumInteraction mi;
         Spectrum betaMedium(1.0f);
         if (photonRay.medium) betaMedium = photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
@@ -291,7 +293,9 @@ void TracePhotonRayRecursive(Ray photonRay, int depth, Spectrum beta,
         }
 
         ++totalPhotonSurfaceInteractions;
-        auto beam = std::make_shared<PhotonBeam>(photonRay.o, isect.p, BeamRadius, beta);
+        if (photonRay.medium) betaMedium = photonRay.medium->Tr(photonRay, localSampler);
+        auto beam = std::make_shared<PhotonBeam>(photonRay.o, isect.p, BeamRadius,
+                                                 betaStart, betaMedium * beta);
         localPhotonBeams.push_back(beam);
         // Sample new photon ray direction from surface
 
@@ -433,7 +437,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                                        localPhotonBeams.end());
             }
         }
-        PhotonBeamBVH photonBeamBVH(photonBeams);
+        PhotonBeamBVH photonBeamBVH(std::move(photonBeams));
 
         // Cast camera rays and gather contributions from photon beams
         std::vector<MemoryArena> perThreadArenas(MaxThreadIndex());
@@ -489,16 +493,18 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                         Spectrum mediumBeta(1.0f);
                         if (ray.medium) mediumBeta = ray.medium->Tr(ray, localSampler);
 
-                        std::vector<std::shared_ptr<PhotonBeam>> beams = photonBeamBVH.Intersect(ray);
-                        for (std::shared_ptr<PhotonBeam> const& beam : beams) {
-                            // Add contribution of photon beam along camera ray
-                            Point3f rayClose, beamClose;
-                            if (ComputeClosestPoints(ray.o, isect.p, beam->start, beam->end, rayClose, beamClose)) {
-                                const Float MaxDistance = currentBeamRadius + beam->radius;
-                                Float distance = (rayClose - beamClose).Length();
-                                if (distance < MaxDistance) {
-                                    Float r = distance / MaxDistance;
-                                    pixel.Ld += 1e-5 * beam->power * sqrt(1.0f - r * r);
+                        if (renderMedia) {
+                            std::vector<std::shared_ptr<PhotonBeam>> beams = photonBeamBVH.Intersect(ray);
+                            for (std::shared_ptr<PhotonBeam> const& beam : beams) {
+                                // Add contribution of photon beam along camera ray
+                                Point3f rayClose, beamClose;
+                                if (ComputeClosestPoints(ray.o, isect.p, beam->start, beam->end, rayClose, beamClose)) {
+                                    const Float MaxDistance = currentBeamRadius + beam->radius;
+                                    Float distance = (rayClose - beamClose).Length();
+                                    if (distance < MaxDistance) {
+                                        Float r = distance / MaxDistance;
+                                        pixel.Ld += 1e-5 * beam->powerEnd * sqrt(1.0f - r * r);
+                                    }
                                 }
                             }
                         }
@@ -512,18 +518,20 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             ray = isect.SpawnRay(ray.d);
                             --depth;
                         } else {
+                            if (!renderSurfaces) {
+                                break;
+                            }
+
                             const BSDF &bsdf = *isect.bsdf;
 
                             // Accumulate direct illumination at SPPM camera ray
                             // intersection
                             Vector3f wo = -ray.d;
-                            if (renderSurfaces) {
-                                if (depth == 0 || specularBounce)
-                                    pixel.Ld += beta * isect.Le(wo);
-                                pixel.Ld +=
-                                        beta * UniformSampleOneLight(isect, scene, arena,
-                                                                     localSampler, true);
-                            }
+                            if (depth == 0 || specularBounce)
+                                pixel.Ld += beta * isect.Le(wo);
+                            pixel.Ld +=
+                                    beta * UniformSampleOneLight(isect, scene, arena,
+                                                                 localSampler, true);
 
                             // Spawn ray from SPPM camera path vertex
                             if (depth < maxDepth - 1) {

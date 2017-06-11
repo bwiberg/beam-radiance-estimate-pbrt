@@ -182,13 +182,26 @@ static void RadixSort(std::vector<MortonPhotonBeam> *v) {
 }
 
 
-//std::vector<std::shared_ptr<PhotonBeam>> Split(std::shared_ptr<PhotonBeam> &beam) {
-//    Bounds3f bounds = beam->WorldBound()
-//}
+std::vector<std::shared_ptr<PhotonBeam>> Split(std::shared_ptr<PhotonBeam> &beam) {
+    const Bounds3f bounds = beam->WorldBound();
+    const Vector3f diag = bounds.Diagonal();
+
+    uint8_t maxIndex = 0, midIndex = 1, minIndex = 2;
+    Point3i indices(0, 1, 2);
+    if (diag[indices[0]] > diag[indices[1]])
+        std::swap(indices[0], indices[1]);
+    if (diag[indices[0]] > diag[indices[2]])
+        std::swap(indices[0], indices[2]);
+    if (diag[indices[1]] > diag[indices[2]])
+        std::swap(indices[1], indices[2]);
+
+
+
+}
 
 
 // BVH Method Definitions
-PhotonBeamBVH::PhotonBeamBVH(const std::vector<std::shared_ptr<PhotonBeam>> &beams,
+PhotonBeamBVH::PhotonBeamBVH(std::vector<std::shared_ptr<PhotonBeam>> && beams,
                              int maxPrimsInNode,
                              SplitMethod splitMethod)
         : maxPrimsInNode(std::min(255, maxPrimsInNode)),
@@ -196,6 +209,10 @@ PhotonBeamBVH::PhotonBeamBVH(const std::vector<std::shared_ptr<PhotonBeam>> &bea
           photonBeams(beams) {
     ProfilePhase _(Prof::PhotonBeamBVHConstruction);
     if (photonBeams.empty()) return;
+
+    // Split beams with weird aspect ratio
+
+
     // Build BVH2 from _primitives_
 
     // Initialize _primitiveInfo_ array for primitives

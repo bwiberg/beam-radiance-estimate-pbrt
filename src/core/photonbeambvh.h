@@ -47,14 +47,15 @@
 namespace pbrt {
 struct PhotonBeam {
     PhotonBeam(Point3f const &start, Point3f const &end,
-               Float radius, Spectrum const &power)
+               Float radius, Spectrum const &powerstart, Spectrum const &powerend)
             : start(start), end(end),
               radius(radius),
-              power(power) {}
+              powerStart(powerstart),
+              powerEnd(powerend){}
 
     Point3f start, end;
     Float radius;
-    Spectrum power;
+    Spectrum powerStart, powerEnd;
 
     Bounds3f WorldBound() const {
         Vector3f dir = end - start;
@@ -87,7 +88,7 @@ public:
     };
 
     // BVH Public Methods
-    PhotonBeamBVH(const std::vector<std::shared_ptr<PhotonBeam>> &beams,
+    PhotonBeamBVH(std::vector<std::shared_ptr<PhotonBeam>> && beams,
                   int maxPrimsInNode = 1,
                   SplitMethod splitMethod = SplitMethod::SAH);
 
