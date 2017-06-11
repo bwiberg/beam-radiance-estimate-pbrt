@@ -30,7 +30,8 @@ public:
     VolSPPMIntegrator(std::shared_ptr<const Camera> &camera, int nIterations,
                       int photonsPerIteration, int maxDepth,
                       Float initialSearchRadius, int writeFrequency,
-                      PhotonType photonType)
+                      PhotonType photonType, PhotonType mediumPhotonType,
+                      bool rendersurfaces, bool rendermedia)
             : camera(camera),
               initialSearchRadius(initialSearchRadius),
               nIterations(nIterations),
@@ -39,7 +40,11 @@ public:
                                   ? photonsPerIteration
                                   : camera->film->croppedPixelBounds.Area()),
               writeFrequency(writeFrequency),
-              photonType(photonType){}
+              photonType(photonType),
+              visibleMediumPointPhotonType(mediumPhotonType),
+              renderSurfaces(rendersurfaces),
+              renderMedia(rendermedia)
+    {}
 
     void Render(const Scene &scene);
 
@@ -53,6 +58,9 @@ private:
     const int writeFrequency;
 
     const PhotonType photonType;
+    const PhotonType visibleMediumPointPhotonType;
+    const bool renderSurfaces;
+    const bool renderMedia;
 };
 
 Integrator *CreateVolSPPMIntegrator(const ParamSet &params,

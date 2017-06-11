@@ -70,12 +70,12 @@ struct VisiblePoint {
     const PhaseFunction *phase;
     Spectrum beta;
 
-    bool IsSurfacePoint() {
+    bool IsSurfacePoint() const {
         CHECK((bsdf && !phase) || (!bsdf && phase));
         return bsdf != nullptr;
     }
 
-    bool IsMediumPoint() {
+    bool IsMediumPoint() const {
         CHECK((bsdf && !phase) || (!bsdf && phase));
         return phase != nullptr;
     }
@@ -568,7 +568,8 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             ProfilePhase _(Prof::SPPMStatsUpdate);
             ParallelFor([&](int i) {
                 SPPMPixel &p = pixels[i];
-                if (p.M > 0) {
+                if (((p.vp.IsSurfacePoint() && renderSurfaces) ||
+                    (p.vp.IsMediumPoint() && renderMedia)) && p.M > 0) {
                     // Update pixel photon count, search radius, and $\tau$ from
                     // photons
                     Float gamma = (Float) 2 / (Float) 3;
@@ -604,6 +605,8 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     // Compute radiance _L_ for SPPM pixel _pixel_
                     const SPPMPixel &pixel =
                             pixels[(y - pixelBounds.pMin.y) * (x1 - x0) + (x - x0)];
+
+                    // Contribute only if visible point should be rendered or not
                     Spectrum L = pixel.Ld / (iter + 1);
                     L += pixel.tau / (Np * Pi * pixel.radius * pixel.radius);
                     image[offset++] = L;
@@ -659,6 +662,7 @@ Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
     int writeFreq = params.FindOneInt("imagewritefrequency", 1 << 31);
     Float radius = params.FindOneFloat("radius", 1.f);
     if (PbrtOptions.quickRender) nIterations = std::max(1, nIterations / 16);
+
     std::string photonTypeStr = params.FindOneString("photontype", "point");
     PhotonType photonType = PhotonType::POINT;
     if (photonTypeStr.compare("point") == 0)
@@ -666,11 +670,25 @@ Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
     else if (photonTypeStr.compare("beam") == 0)
         photonType = PhotonType::BEAM;
     else
-        Error("Expected photontype as \"point\" or \"beam\", got %s. Defaulting to \"point\"", photonTypeStr.c_str());
+        Error("Expected photontype to be \"point\" or \"beam\", got %s. Defaulting to \"point\"",
+              photonTypeStr.c_str());
+    photonTypeStr = params.FindOneString("vmpphotontype", "point");
+    PhotonType vmpphotontype = PhotonType::POINT;
+    if (photonTypeStr.compare("point") == 0)
+        vmpphotontype = PhotonType::POINT;
+    else if (photonTypeStr.compare("beam") == 0)
+        vmpphotontype = PhotonType::BEAM;
+    else
+        Error("Expected vmpphotontype to be \"point\" or \"beam\", got %s. Defaulting to \"point\"",
+              photonTypeStr.c_str());
+
+    bool renderSurfaces = params.FindOneBool("rendersurfaces", true);
+    bool renderMedia = params.FindOneBool("rendermedia", true);
 
     return new VolSPPMIntegrator(camera, nIterations, photonsPerIter, maxDepth,
                                  radius, writeFreq,
-                                 photonType);
+                                 photonType, vmpphotontype,
+                                 renderSurfaces, renderMedia);
 }
 
 }  // namespace pbrt
