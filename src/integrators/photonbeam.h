@@ -24,10 +24,12 @@ public:
     // PhotonBeamIntegrator Public Methods
     PhotonBeamIntegrator(std::shared_ptr<const Camera> &camera, int nIterations,
                          int beamsPerIteraion, int maxDepth,
-                         Float initialSearchRadius, int writeFrequency,
+                         Float initialSearchRadius, Float alpha,
+                         int writeFrequency,
                          bool rendersurfaces, bool rendermedia)
             : camera(camera),
               initialBeamRadius(initialSearchRadius),
+              alpha(alpha),
               nIterations(nIterations),
               maxDepth(maxDepth),
               photonsPerIteration(beamsPerIteraion > 0
@@ -44,6 +46,7 @@ private:
     // SPPMIntegrator Private Data
     std::shared_ptr<const Camera> camera;
     const Float initialBeamRadius;
+    const Float alpha;
     const int nIterations;
     const int maxDepth;
     const int photonsPerIteration;

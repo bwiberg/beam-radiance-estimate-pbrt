@@ -65,15 +65,10 @@ STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 // SPPM Local Definitions
 struct PhotonBeamPixel {
     // PhotonBeamPixel Public Methods
-    PhotonBeamPixel() : M(0) {}
+    PhotonBeamPixel() {}
 
     // PhotonBeamPixel Public Data
-    Float radius = 0;
     Spectrum Ld;
-    AtomicFloat Phi[Spectrum::nSamples];
-    std::atomic<int> M;
-    Float N = 0;
-    Spectrum tau;
 };
 
 struct PhotonBeamPixelListNode {
@@ -336,7 +331,6 @@ void PhotonBeamIntegrator::Render(const Scene &scene) {
     Bounds2i pixelBounds = camera->film->croppedPixelBounds;
     int nPixels = pixelBounds.Area();
     std::unique_ptr<PhotonBeamPixel[]> pixels(new PhotonBeamPixel[nPixels]);
-    for (int i = 0; i < nPixels; ++i) pixels[i].radius = initialBeamRadius;
     const Float invSqrtSPP = 1.f / std::sqrt(nIterations);
     pixelMemoryBytes = nPixels * sizeof(PhotonBeamPixel);
     // Compute _lightDistr_ for sampling lights proportional to power
@@ -560,32 +554,8 @@ void PhotonBeamIntegrator::Render(const Scene &scene) {
         }
         progress.Update();
 
-        currentBeamRadius = 0.992f * currentBeamRadius;
-
-        // Update pixel values from this pass's photons
-        {
-            ProfilePhase _(Prof::SPPMStatsUpdate);
-            ParallelFor([&](int i) {
-                PhotonBeamPixel &p = pixels[i];
-                if (p.M > 0) {
-                    // Update pixel photon count, search radius, and $\tau$ from
-                    // photons
-                    Float gamma = (Float) 2 / (Float) 3;
-                    Float Nnew = p.N + gamma * p.M;
-                    Float Rnew = p.radius * std::sqrt(Nnew / (p.N + p.M));
-                    Spectrum Phi;
-                    for (int j = 0; j < Spectrum::nSamples; ++j)
-                        Phi[j] = p.Phi[j];
-                    p.tau = (p.tau + Phi) * (Rnew * Rnew) /
-                            (p.radius * p.radius);
-                    p.N = Nnew;
-                    p.radius = Rnew;
-                    p.M = 0;
-                    for (int j = 0; j < Spectrum::nSamples; ++j)
-                        p.Phi[j] = (Float) 0;
-                }
-            }, nPixels, 4096);
-        }
+        // update beam radius according to variance/bias rule
+        currentBeamRadius = currentBeamRadius * (Float(iter + alpha) / Float(iter + 1));
 
         // Periodically store SPPM image in film and write image
         if (iter + 1 == nIterations || ((iter + 1) % writeFrequency) == 0) {
@@ -602,46 +572,11 @@ void PhotonBeamIntegrator::Render(const Scene &scene) {
 
                     // Contribute only if visible point should be rendered or not
                     Spectrum L = pixel.Ld / (iter + 1);
-                    L += pixel.tau / (Np * Pi * pixel.radius * pixel.radius);
                     image[offset++] = L;
                 }
             }
             camera->film->SetImage(image.get());
             camera->film->WriteImage();
-            // Write SPPM radius image, if requested
-            if (getenv("SPPM_RADIUS")) {
-                std::unique_ptr<Float[]> rimg(
-                        new Float[3 * pixelBounds.Area()]);
-                Float minrad = 1e30f, maxrad = 0;
-                for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
-                    for (int x = x0; x < x1; ++x) {
-                        const PhotonBeamPixel &p =
-                                pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
-                                       (x - x0)];
-                        minrad = std::min(minrad, p.radius);
-                        maxrad = std::max(maxrad, p.radius);
-                    }
-                }
-                fprintf(stderr,
-                        "iterations: %d (%.2f s) radius range: %f - %f\n",
-                        iter + 1, progress.ElapsedMS() / 1000., minrad, maxrad);
-                int offset = 0;
-                for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
-                    for (int x = x0; x < x1; ++x) {
-                        const PhotonBeamPixel &p =
-                                pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
-                                       (x - x0)];
-                        Float v = 1.f - (p.radius - minrad) / (maxrad - minrad);
-                        rimg[offset++] = v;
-                        rimg[offset++] = v;
-                        rimg[offset++] = v;
-                    }
-                }
-                Point2i res(pixelBounds.pMax.x - pixelBounds.pMin.x,
-                            pixelBounds.pMax.y - pixelBounds.pMin.y);
-                std::stringstream ss;
-                WriteImage("sppm_radius.exr", rimg.get(), pixelBounds, res);
-            }
         }
     }
     progress.Done();
@@ -656,14 +591,15 @@ Integrator *CreatePhotonBeamIntegrator(const ParamSet &params,
     int photonsPerIter = params.FindOneInt("photonsperiteration", -1);
     int writeFreq = params.FindOneInt("imagewritefrequency", 1 << 31);
     Float radius = params.FindOneFloat("initialbeamradius", 1.f);
+    Float alpha = params.FindOneFloat("alpha", 0.5f);
     if (PbrtOptions.quickRender) nIterations = std::max(1, nIterations / 16);
 
     bool renderSurfaces = params.FindOneBool("rendersurfaces", true);
     bool renderMedia = params.FindOneBool("rendermedia", true);
 
-
     return new PhotonBeamIntegrator(camera, nIterations, photonsPerIter, maxDepth,
-                                    radius, writeFreq,
+                                    radius, alpha,
+                                    writeFreq,
                                     renderSurfaces, renderMedia);
 }
 
