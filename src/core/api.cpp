@@ -61,6 +61,7 @@
 #include "integrators/vsppm.h"
 #include "integrators/volpath.h"
 #include "integrators/photonmap.h"
+#include "integrators/photonbeam.h"
 #include "integrators/volphotonmap.h"
 #include "integrators/whitted.h"
 #include "lights/diffuse.h"
@@ -1459,13 +1460,15 @@ Integrator *RenderOptions::MakeIntegrator() const {
         integrator = CreateSPPMIntegrator(IntegratorParams, camera);
     else if (IntegratorName == "vsppm")
         integrator = CreateVolSPPMIntegrator(IntegratorParams, camera);
+    else if (IntegratorName == "photonbeam")
+        integrator = CreatePhotonBeamIntegrator(IntegratorParams, camera);
     else {
         Error("Integrator \"%s\" unknown.", IntegratorName.c_str());
         return nullptr;
     }
 
     if (renderOptions->haveScatteringMedia && IntegratorName != "volpath" &&
-        IntegratorName != "bdpt" && IntegratorName != "mlt" && IntegratorName != "vsppm") {
+        IntegratorName != "bdpt" && IntegratorName != "mlt" && IntegratorName != "vsppm" && IntegratorName != "photonbeam") {
         Warning(
             "Scene has scattering media but \"%s\" integrator doesn't support "
             "volume scattering. Consider using \"volpath\", \"bdpt\", or "

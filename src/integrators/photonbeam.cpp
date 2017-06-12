@@ -32,7 +32,7 @@
 
 
 // integrators/sppm.cpp*
-#include "integrators/vsppm.h"
+#include "integrators/photonbeam.h"
 #include "scene.h"
 #include "imageio.h"
 #include "paramset.h"
@@ -45,29 +45,29 @@
 namespace pbrt {
 
 STAT_RATIO(
-        "Stochastic Progressive Photon Mapping/Visible points checked per photon "
+        "Progressive Photon Beams/Visible points checked per photon "
                 "intersection",
         visiblePointsChecked, totalPhotonSurfaceInteractions);
-STAT_COUNTER("Stochastic Progressive Photon Mapping/Photon paths followed",
+STAT_COUNTER("Progressive Photon Beams/Photon paths followed",
              photonPaths);
-STAT_COUNTER("Stochastic Progressive Photon Mapping/Total photon medium interactions",
+STAT_COUNTER("Progressive Photon Beams/Total photon medium interactions",
              totalPhotonMediumInteractions);
-STAT_COUNTER("Stochastic Progressive Photon Mapping/Total visible points in participating media",
+STAT_COUNTER("Progressive Photon Beams/Total visible points in participating media",
              totalVisibleMediumPoints);
-STAT_COUNTER("Stochastic Progressive Photon Mapping/Total visible points on surfaces",
+STAT_COUNTER("Progressive Photon Beams/Total visible points on surfaces",
              totalVisibleSurfacePoints);
 STAT_INT_DISTRIBUTION(
-        "Stochastic Progressive Photon Mapping/Grid cells per visible point",
+        "Progressive Photon Beams/Grid cells per visible point",
         gridCellsPerVisiblePoint);
 STAT_MEMORY_COUNTER("Memory/SPPM Pixels", pixelMemoryBytes);
 STAT_FLOAT_DISTRIBUTION("Memory/SPPM BSDF and Grid Memory", memoryArenaMB);
 
 // SPPM Local Definitions
-struct VolSPPMPixel {
-    // VolSPPMPixel Public Methods
-    VolSPPMPixel() : M(0) {}
+struct PhotonBeamPixel {
+    // PhotonBeamPixel Public Methods
+    PhotonBeamPixel() : M(0) {}
 
-    // VolSPPMPixel Public Data
+    // PhotonBeamPixel Public Data
     Float radius = 0;
     Spectrum Ld;
     AtomicFloat Phi[Spectrum::nSamples];
@@ -76,119 +76,119 @@ struct VolSPPMPixel {
     Spectrum tau;
 };
 
-struct VolSPPMPixelListNode {
-    VolSPPMPixel *pixel;
-    VolSPPMPixelListNode *next;
+struct PhotonBeamPixelListNode {
+    PhotonBeamPixel *pixel;
+    PhotonBeamPixelListNode *next;
 };
 
-//Float Determinant(const Vector3f &a, const Vector3f &b, const Vector3f &c) {
-//    // a b c
-//    // d e f
-//    // g h i
-//    return a.x * b.y * c.z + a.y * b.z * c.x + a.z * b.x * c.y
-//        - (a.z * b.y * c.x + a.y * b.x * c.z + a.x * b.z * c.y);
-//}
+Float Determinant(const Vector3f &a, const Vector3f &b, const Vector3f &c) {
+    // a b c
+    // d e f
+    // g h i
+    return a.x * b.y * c.z + a.y * b.z * c.x + a.z * b.x * c.y
+        - (a.z * b.y * c.x + a.y * b.x * c.z + a.x * b.z * c.y);
+}
 
-//bool ComputeClosestPoints(const Point3f &a0, const Point3f &a1,
-//                          const Point3f &b0, const Point3f &b1,
-//                          Point3f &aClosest, Point3f &bClosest) {
-//    Vector3f A = a1 - a0;
-//    Vector3f B = b1 - b0;
-//    Float magA = A.Length();
-//    Float magB = B.Length();
-//
-//    if (magA == 0.0f) {
-//        aClosest = a0;
-//        if (magB == 0.0f) {
-//            bClosest = b0;
-//            return true;
-//        }
-//        // Line segment A is a point, project A on B and clamp to end points
-//        B /= magB;
-//
-//        A = a0 - b0;
-//        Float dot = Dot(A, B);
-//        bClosest = b0 + B * Clamp(dot, 0.0f, magB);
-//
-//        return true;
-//    } else if (magB == 0.0f) {
-//        bClosest = b0;
-//        // Line segment B is a point, project B on A and clamp to end points
-//        A /= magA;
-//
-//        B = b0 - a0;
-//        Float dot = Dot(A, B);
-//        aClosest = a0 + A * Clamp(dot, 0.0f, magA);
-//
-//        return true;
-//    }
-//
-//    A /= magA;
-//    B /= magB;
-//
-//    const Vector3f cross = Cross(A, B);
-//    const Float denom = cross.LengthSquared();
-//
-//    // If lines are parallel (denom=0) test if lines overlap.
-//    // If they don't overlap then there is a closest point solution.
-//    // If they do overlap, there are infinite closest positions,
-//    // but there is a closest distance
-//    if (denom == Float(0.0f)) {
-//        Float d0 = Dot(A, b0 - a0);
-//        Float d1 = Dot(A, b1 - a0);
-//
-//        //# Is segment B before A?
-//        if (d0 <= 0 && d1 <= 0) {
-//            if (fabs(d0) < fabs(d1)) {
-//                aClosest = a0;
-//                bClosest = b1;
-//            }
-//            aClosest = a0;
-//            bClosest = b1;
-//        }
-//
-//        // Is segment B after A?
-//        else if (d0 >= magA && d1 >= magA) {
-//            if (fabs(d0) < fabs(d1)) {
-//                aClosest = a1;
-//                bClosest = b1;
-//            }
-//            aClosest = a1;
-//            bClosest = b1;
-//        }
-//
-//        return false;
-//    }
-//
-//    // Lines criss-cross: Calculate the projected closest points
-//    const Vector3f t = b0 - a0;
-//    const Float detA = Determinant(t, B, cross);
-//    const Float detB = Determinant(t, A, cross);
-//
-//    const Float t0 = detA / denom;
-//    const Float t1 = detB / denom;
-//
-//    Point3f pA = a0 + A * t0;
-//    Point3f pB = b0 + B * t1;
-//
-//    if (t0 < 0) pA = a0;
-//    else if (t0 > magA) pA = a1;
-//
-//    // clamp projection of A
-//    if (t0 < 0 || t0 > magA) {
-//        Float dot = Clamp(Dot(B, pA - b0), 0.0f, magB);
-//        pB = b0 + B * dot;
-//    }
-//
-//    if (t1 < 0 || t1 > magB) {
-//        Float dot = Clamp(Dot(A, pB - a0), 0.0f, magA);
-//        pA = a0 + A * dot;
-//    }
-//
-//    aClosest = pA;
-//    bClosest = pB;
-//    return true;
-//}
+bool ComputeClosestPoints(const Point3f &a0, const Point3f &a1,
+                          const Point3f &b0, const Point3f &b1,
+                          Point3f &aClosest, Point3f &bClosest) {
+    Vector3f A = a1 - a0;
+    Vector3f B = b1 - b0;
+    Float magA = A.Length();
+    Float magB = B.Length();
+
+    if (magA == 0.0f) {
+        aClosest = a0;
+        if (magB == 0.0f) {
+            bClosest = b0;
+            return true;
+        }
+        // Line segment A is a point, project A on B and clamp to end points
+        B /= magB;
+
+        A = a0 - b0;
+        Float dot = Dot(A, B);
+        bClosest = b0 + B * Clamp(dot, 0.0f, magB);
+
+        return true;
+    } else if (magB == 0.0f) {
+        bClosest = b0;
+        // Line segment B is a point, project B on A and clamp to end points
+        A /= magA;
+
+        B = b0 - a0;
+        Float dot = Dot(A, B);
+        aClosest = a0 + A * Clamp(dot, 0.0f, magA);
+
+        return true;
+    }
+
+    A /= magA;
+    B /= magB;
+
+    const Vector3f cross = Cross(A, B);
+    const Float denom = cross.LengthSquared();
+
+    // If lines are parallel (denom=0) test if lines overlap.
+    // If they don't overlap then there is a closest point solution.
+    // If they do overlap, there are infinite closest positions,
+    // but there is a closest distance
+    if (denom == Float(0.0f)) {
+        Float d0 = Dot(A, b0 - a0);
+        Float d1 = Dot(A, b1 - a0);
+
+        //# Is segment B before A?
+        if (d0 <= 0 && d1 <= 0) {
+            if (fabs(d0) < fabs(d1)) {
+                aClosest = a0;
+                bClosest = b1;
+            }
+            aClosest = a0;
+            bClosest = b1;
+        }
+
+        // Is segment B after A?
+        else if (d0 >= magA && d1 >= magA) {
+            if (fabs(d0) < fabs(d1)) {
+                aClosest = a1;
+                bClosest = b1;
+            }
+            aClosest = a1;
+            bClosest = b1;
+        }
+
+        return false;
+    }
+
+    // Lines criss-cross: Calculate the projected closest points
+    const Vector3f t = b0 - a0;
+    const Float detA = Determinant(t, B, cross);
+    const Float detB = Determinant(t, A, cross);
+
+    const Float t0 = detA / denom;
+    const Float t1 = detB / denom;
+
+    Point3f pA = a0 + A * t0;
+    Point3f pB = b0 + B * t1;
+
+    if (t0 < 0) pA = a0;
+    else if (t0 > magA) pA = a1;
+
+    // clamp projection of A
+    if (t0 < 0 || t0 > magA) {
+        Float dot = Clamp(Dot(B, pA - b0), 0.0f, magB);
+        pB = b0 + B * dot;
+    }
+
+    if (t1 < 0 || t1 > magB) {
+        Float dot = Clamp(Dot(A, pB - a0), 0.0f, magA);
+        pA = a0 + A * dot;
+    }
+
+    aClosest = pA;
+    bClosest = pB;
+    return true;
+}
 
 class AwesomeSampler : public Sampler {
 public:
@@ -260,85 +260,85 @@ private:
     RNG rng;
 };
 
-//void TracePhotonBeamRecursive(Ray photonRay, int depth, Spectrum beta,
-//                              Sampler &localSampler, const Scene &scene,
-//                              const int MaxDepth, MemoryArena &arena, const Float BeamRadius,
-//                              std::vector<std::shared_ptr<PhotonBeam>> &localPhotonBeams) {
-//    SurfaceInteraction isect;
-//    for (; depth < MaxDepth; ++depth) {
-//        if (!scene.Intersect(photonRay, &isect)) break;
-//
-//        Spectrum betaStart;
-//
-//        MediumInteraction mi;
-//        Spectrum betaMedium(1.0f);
-//        if (photonRay.medium) betaMedium = photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
-//        if (beta.IsBlack()) break;
-//
-//        // Handle an interaction with a medium or a surface
-//        if (mi.IsValid()) {
-//            ++totalPhotonMediumInteractions;
-//
-//            // Sample new photon ray direction from volume
-//            Vector3f wo = -photonRay.d, wi;
-//            mi.phase->Sample_p(wo, &wi, localSampler.Get2D());
-//            Ray mediumScatteredRay = mi.SpawnRay(wi);
-//
-//            Spectrum scatteredBeta = beta * photonRay.medium->Tr(photonRay, localSampler);
-//            TracePhotonBeamRecursive(mediumScatteredRay, depth + 1, scatteredBeta,
-//                                     localSampler, scene,
-//                                     MaxDepth, arena, BeamRadius,
-//                                     localPhotonBeams);
-//
-//        }
-//
-//        ++totalPhotonSurfaceInteractions;
-//        if (photonRay.medium) betaMedium = photonRay.medium->Tr(photonRay, localSampler);
-//        auto beam = std::make_shared<PhotonBeam>(photonRay.o, isect.p, BeamRadius,
-//                                                 betaStart, betaMedium * beta);
-//        localPhotonBeams.push_back(beam);
-//        // Sample new photon ray direction from surface
-//
-//        // Compute BSDF at photon intersection point
-//        isect.ComputeScatteringFunctions(photonRay, arena, true,
-//                                         TransportMode::Importance);
-//        if (!isect.bsdf) {
-//            --depth;
-//            photonRay = isect.SpawnRay(photonRay.d);
-//            continue;
-//        }
-//        const BSDF &isectBSDF = *isect.bsdf;
-//
-//        // Sample BSDF _fr_ and direction _wi_ for reflected photon
-//        Vector3f wo = -photonRay.d, wi;
-//        Float pdf;
-//        BxDFType flags;
-//
-//        // Generate _bsdfSample_ for outgoing photon sample
-//        Spectrum fr = isectBSDF.Sample_f(wo, &wi, localSampler.Get2D(), &pdf,
-//                                          BSDF_ALL, &flags);
-//        if (fr.IsBlack() || pdf == 0.f) break;
-//        Spectrum betaNew = betaMedium * beta * fr * AbsDot(wi, isect.shading.n) / pdf;
-//
-//        photonRay = (RayDifferential) isect.SpawnRay(wi);
-//
-//        // Possibly terminate photon path with Russian roulette
-//        Float q = std::max((Float) 0, 1 - betaNew.y() / beta.y());
-//        if (localSampler.Get1D() < q) break;
-//        beta = betaNew / (1 - q);
-//    }
-//}
+void TracePhotonBeamRecursive(Ray photonRay, int depth, Spectrum beta,
+                              Sampler &localSampler, const Scene &scene,
+                              const int MaxDepth, MemoryArena &arena, const Float BeamRadius,
+                              std::vector<std::shared_ptr<PhotonBeam>> &localPhotonBeams) {
+    SurfaceInteraction isect;
+    for (; depth < MaxDepth; ++depth) {
+        if (!scene.Intersect(photonRay, &isect)) break;
+
+        Spectrum betaStart;
+
+        MediumInteraction mi;
+        Spectrum betaMedium(1.0f);
+        if (photonRay.medium) betaMedium = photonRay.medium->Sample(photonRay, localSampler, arena, &mi);
+        if (beta.IsBlack()) break;
+
+        // Handle an interaction with a medium or a surface
+        if (mi.IsValid()) {
+            ++totalPhotonMediumInteractions;
+
+            // Sample new photon ray direction from volume
+            Vector3f wo = -photonRay.d, wi;
+            mi.phase->Sample_p(wo, &wi, localSampler.Get2D());
+            Ray mediumScatteredRay = mi.SpawnRay(wi);
+
+            Spectrum scatteredBeta = beta * photonRay.medium->Tr(photonRay, localSampler);
+            TracePhotonBeamRecursive(mediumScatteredRay, depth + 1, scatteredBeta,
+                                     localSampler, scene,
+                                     MaxDepth, arena, BeamRadius,
+                                     localPhotonBeams);
+
+        }
+
+        ++totalPhotonSurfaceInteractions;
+        if (photonRay.medium) betaMedium = photonRay.medium->Tr(photonRay, localSampler);
+        auto beam = std::make_shared<PhotonBeam>(photonRay.o, isect.p, BeamRadius,
+                                                 betaStart, betaMedium * beta);
+        localPhotonBeams.push_back(beam);
+        // Sample new photon ray direction from surface
+
+        // Compute BSDF at photon intersection point
+        isect.ComputeScatteringFunctions(photonRay, arena, true,
+                                         TransportMode::Importance);
+        if (!isect.bsdf) {
+            --depth;
+            photonRay = isect.SpawnRay(photonRay.d);
+            continue;
+        }
+        const BSDF &isectBSDF = *isect.bsdf;
+
+        // Sample BSDF _fr_ and direction _wi_ for reflected photon
+        Vector3f wo = -photonRay.d, wi;
+        Float pdf;
+        BxDFType flags;
+
+        // Generate _bsdfSample_ for outgoing photon sample
+        Spectrum fr = isectBSDF.Sample_f(wo, &wi, localSampler.Get2D(), &pdf,
+                                          BSDF_ALL, &flags);
+        if (fr.IsBlack() || pdf == 0.f) break;
+        Spectrum betaNew = betaMedium * beta * fr * AbsDot(wi, isect.shading.n) / pdf;
+
+        photonRay = (RayDifferential) isect.SpawnRay(wi);
+
+        // Possibly terminate photon path with Russian roulette
+        Float q = std::max((Float) 0, 1 - betaNew.y() / beta.y());
+        if (localSampler.Get1D() < q) break;
+        beta = betaNew / (1 - q);
+    }
+}
 
 // SPPM Method Definitions
-void VolSPPMIntegrator::Render(const Scene &scene) {
+void PhotonBeamIntegrator::Render(const Scene &scene) {
     ProfilePhase p(Prof::IntegratorRender);
     // Initialize _pixelBounds_ and _pixels_ array for SPPM
     Bounds2i pixelBounds = camera->film->croppedPixelBounds;
     int nPixels = pixelBounds.Area();
-    std::unique_ptr<VolSPPMPixel[]> pixels(new VolSPPMPixel[nPixels]);
-    for (int i = 0; i < nPixels; ++i) pixels[i].radius = initialSearchRadius;
+    std::unique_ptr<PhotonBeamPixel[]> pixels(new PhotonBeamPixel[nPixels]);
+    for (int i = 0; i < nPixels; ++i) pixels[i].radius = initialBeamRadius;
     const Float invSqrtSPP = 1.f / std::sqrt(nIterations);
-    pixelMemoryBytes = nPixels * sizeof(VolSPPMPixel);
+    pixelMemoryBytes = nPixels * sizeof(PhotonBeamPixel);
     // Compute _lightDistr_ for sampling lights proportional to power
     std::unique_ptr<Distribution1D> lightDistr =
             ComputeLightPowerDistribution(scene);
@@ -356,7 +356,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
     // Counter to extend HaltonSampler values beyond 1000
     uint64_t globalNumPixels = 0;
 
-    Float currentBeamRadius = 5.0f;
+    Float currentBeamRadius = initialBeamRadius;
     for (int iter = 0; iter < nIterations; ++iter) {
         // Counter to extend HaltonSampler values beyond 1000
         uint32_t iterNumPixels = 0;
@@ -415,10 +415,10 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                     Spectrum beta = (AbsDot(nLight, photonRay.d) * Le) /
                                     (lightPdf * pdfPos * pdfDir);
                     if (beta.IsBlack()) continue;
-//                    TracePhotonBeamRecursive(photonRay, 0, beta,
-//                                             localSampler, scene,
-//                                             maxDepth, arena, currentBeamRadius,
-//                                             localPhotonBeams);
+                    TracePhotonBeamRecursive(photonRay, 0, beta,
+                                            localSampler, scene,
+                                            maxDepth, arena, currentBeamRadius,
+                                            localPhotonBeams);
                     arena.Reset();
                 }
             }, NumTasks, 1);
@@ -471,12 +471,12 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             camera->GenerateRayDifferential(cameraSample, &ray);
                     ray.ScaleDifferentials(invSqrtSPP);
 
-                    // Get _VolSPPMPixel_ for _pPixel_
+                    // Get _PhotonBeamPixel_ for _pPixel_
                     Point2i pPixelO = Point2i(pPixel - pixelBounds.pMin);
                     int pixelOffset =
                             pPixelO.x +
                             pPixelO.y * (pixelBounds.pMax.x - pixelBounds.pMin.x);
-                    VolSPPMPixel &pixel = pixels[pixelOffset];
+                    PhotonBeamPixel &pixel = pixels[pixelOffset];
                     bool specularBounce = false;
                     for (int depth = 0; depth < maxDepth; ++depth) {
                         SurfaceInteraction isect;
@@ -498,14 +498,14 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                             for (std::shared_ptr<PhotonBeam> const& beam : beams) {
                                 // Add contribution of photon beam along camera ray
                                 Point3f rayClose, beamClose;
-//                                if (ComputeClosestPoints(ray.o, isect.p, beam->start, beam->end, rayClose, beamClose)) {
-//                                    const Float MaxDistance = currentBeamRadius + beam->radius;
-//                                    Float distance = (rayClose - beamClose).Length();
-//                                    if (distance < MaxDistance) {
-//                                        Float r = distance / MaxDistance;
-//                                        pixel.Ld += 1e-5 * beam->powerEnd * sqrt(1.0f - r * r);
-//                                    }
-//                                }
+                                if (ComputeClosestPoints(ray.o, isect.p, beam->start, beam->end, rayClose, beamClose)) {
+                                    const Float MaxDistance = currentBeamRadius + beam->radius;
+                                    Float distance = (rayClose - beamClose).Length();
+                                    if (distance < MaxDistance) {
+                                        Float r = distance / MaxDistance;
+                                        pixel.Ld += 1e-5 * beam->powerEnd * sqrt(1.0f - r * r);
+                                    }
+                                }
                             }
                         }
 
@@ -566,7 +566,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
         {
             ProfilePhase _(Prof::SPPMStatsUpdate);
             ParallelFor([&](int i) {
-                VolSPPMPixel &p = pixels[i];
+                PhotonBeamPixel &p = pixels[i];
                 if (p.M > 0) {
                     // Update pixel photon count, search radius, and $\tau$ from
                     // photons
@@ -597,7 +597,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
             for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                 for (int x = x0; x < x1; ++x) {
                     // Compute radiance _L_ for SPPM pixel _pixel_
-                    const VolSPPMPixel &pixel =
+                    const PhotonBeamPixel &pixel =
                             pixels[(y - pixelBounds.pMin.y) * (x1 - x0) + (x - x0)];
 
                     // Contribute only if visible point should be rendered or not
@@ -615,7 +615,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 Float minrad = 1e30f, maxrad = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const VolSPPMPixel &p =
+                        const PhotonBeamPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         minrad = std::min(minrad, p.radius);
@@ -628,7 +628,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 int offset = 0;
                 for (int y = pixelBounds.pMin.y; y < pixelBounds.pMax.y; ++y) {
                     for (int x = x0; x < x1; ++x) {
-                        const VolSPPMPixel &p =
+                        const PhotonBeamPixel &p =
                                 pixels[(y - pixelBounds.pMin.y) * (x1 - x0) +
                                        (x - x0)];
                         Float v = 1.f - (p.radius - minrad) / (maxrad - minrad);
@@ -639,6 +639,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
                 }
                 Point2i res(pixelBounds.pMax.x - pixelBounds.pMin.x,
                             pixelBounds.pMax.y - pixelBounds.pMin.y);
+                std::stringstream ss;
                 WriteImage("sppm_radius.exr", rimg.get(), pixelBounds, res);
             }
         }
@@ -646,7 +647,7 @@ void VolSPPMIntegrator::Render(const Scene &scene) {
     progress.Done();
 }
 
-Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
+Integrator *CreatePhotonBeamIntegrator(const ParamSet &params,
                                     std::shared_ptr<const Camera> camera) {
     int nIterations =
             params.FindOneInt("iterations",
@@ -654,35 +655,16 @@ Integrator *CreateVolSPPMIntegrator(const ParamSet &params,
     int maxDepth = params.FindOneInt("maxdepth", 5);
     int photonsPerIter = params.FindOneInt("photonsperiteration", -1);
     int writeFreq = params.FindOneInt("imagewritefrequency", 1 << 31);
-    Float radius = params.FindOneFloat("radius", 1.f);
+    Float radius = params.FindOneFloat("initialbeamradius", 1.f);
     if (PbrtOptions.quickRender) nIterations = std::max(1, nIterations / 16);
-
-    std::string photonTypeStr = params.FindOneString("photontype", "point");
-    PhotonType photonType = PhotonType::POINT;
-    if (photonTypeStr.compare("point") == 0)
-        photonType = PhotonType::POINT;
-    else if (photonTypeStr.compare("beam") == 0)
-        photonType = PhotonType::BEAM;
-    else
-        Error("Expected photontype to be \"point\" or \"beam\", got %s. Defaulting to \"point\"",
-              photonTypeStr.c_str());
-    photonTypeStr = params.FindOneString("vmpphotontype", "point");
-    PhotonType vmpphotontype = PhotonType::POINT;
-    if (photonTypeStr.compare("point") == 0)
-        vmpphotontype = PhotonType::POINT;
-    else if (photonTypeStr.compare("beam") == 0)
-        vmpphotontype = PhotonType::BEAM;
-    else
-        Error("Expected vmpphotontype to be \"point\" or \"beam\", got %s. Defaulting to \"point\"",
-              photonTypeStr.c_str());
 
     bool renderSurfaces = params.FindOneBool("rendersurfaces", true);
     bool renderMedia = params.FindOneBool("rendermedia", true);
 
-    return new VolSPPMIntegrator(camera, nIterations, photonsPerIter, maxDepth,
-                                 radius, writeFreq,
-                                 photonType, vmpphotontype,
-                                 renderSurfaces, renderMedia);
+
+    return new PhotonBeamIntegrator(camera, nIterations, photonsPerIter, maxDepth,
+                                    radius, writeFreq,
+                                    renderSurfaces, renderMedia);
 }
 
 }  // namespace pbrt
