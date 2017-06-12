@@ -345,13 +345,17 @@ void PhotonBeamIntegrator::Render(const Scene &scene) {
     const int tileSize = 16;
     Point2i nTiles((pixelExtent.x + tileSize - 1) / tileSize,
                    (pixelExtent.y + tileSize - 1) / tileSize);
-    ProgressReporter progress(2 * nIterations, "Rendering");
+    ProgressReporter progress(2 * (endIteration - startIteration), "Rendering");
 
     // Counter to extend HaltonSampler values beyond 1000
     uint64_t globalNumPixels = 0;
 
+    // Set the beam radius to the correct value
     Float currentBeamRadius = initialBeamRadius;
-    for (int iter = 0; iter < nIterations; ++iter) {
+    for (int i = 0; i < startIteration; ++i)
+        currentBeamRadius = currentBeamRadius * (Float(i + alpha) / Float(i + 1));
+
+    for (int iter = startIteration; iter < endIteration; ++iter) {
         // Counter to extend HaltonSampler values beyond 1000
         uint32_t iterNumPixels = 0;
 
@@ -558,7 +562,7 @@ void PhotonBeamIntegrator::Render(const Scene &scene) {
         currentBeamRadius = currentBeamRadius * (Float(iter + alpha) / Float(iter + 1));
 
         // Periodically store SPPM image in film and write image
-        if (iter + 1 == nIterations || ((iter + 1) % writeFrequency) == 0) {
+        if (iter + 1 == (endIteration) || ((iter + 1) % writeFrequency) == 0) {
             int x0 = pixelBounds.pMin.x;
             int x1 = pixelBounds.pMax.x;
             uint64_t Np = (uint64_t) (iter + 1) * (uint64_t) photonsPerIteration;
@@ -587,6 +591,8 @@ Integrator *CreatePhotonBeamIntegrator(const ParamSet &params,
     int nIterations =
             params.FindOneInt("iterations",
                               params.FindOneInt("numiterations", 64));
+    int startIteration = params.FindOneInt("startiteration", 0);
+    int endIteration = params.FindOneInt("enditeration", nIterations);
     int maxDepth = params.FindOneInt("maxdepth", 5);
     int photonsPerIter = params.FindOneInt("photonsperiteration", -1);
     int writeFreq = params.FindOneInt("imagewritefrequency", 1 << 31);
@@ -598,6 +604,7 @@ Integrator *CreatePhotonBeamIntegrator(const ParamSet &params,
     bool renderMedia = params.FindOneBool("rendermedia", true);
 
     return new PhotonBeamIntegrator(camera, nIterations, photonsPerIter, maxDepth,
+                                    startIteration, endIteration,
                                     radius, alpha,
                                     writeFreq,
                                     renderSurfaces, renderMedia);

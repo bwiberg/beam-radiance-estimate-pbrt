@@ -23,7 +23,8 @@ class PhotonBeamIntegrator : public Integrator {
 public:
     // PhotonBeamIntegrator Public Methods
     PhotonBeamIntegrator(std::shared_ptr<const Camera> &camera, int nIterations,
-                         int beamsPerIteraion, int maxDepth,
+                         int beamsPerIteration, int maxDepth,
+                         int startIteration, int endIteration,
                          Float initialSearchRadius, Float alpha,
                          int writeFrequency,
                          bool rendersurfaces, bool rendermedia)
@@ -31,9 +32,10 @@ public:
               initialBeamRadius(initialSearchRadius),
               alpha(alpha),
               nIterations(nIterations),
+              startIteration(startIteration), endIteration(endIteration),
               maxDepth(maxDepth),
-              photonsPerIteration(beamsPerIteraion > 0
-                                  ? beamsPerIteraion
+              photonsPerIteration(beamsPerIteration > 0
+                                  ? beamsPerIteration
                                   : camera->film->croppedPixelBounds.Area()),
               writeFrequency(writeFrequency),
               renderSurfaces(rendersurfaces),
@@ -48,6 +50,8 @@ private:
     const Float initialBeamRadius;
     const Float alpha;
     const int nIterations;
+    const int startIteration;
+    const int endIteration;
     const int maxDepth;
     const int photonsPerIteration;
     const int writeFrequency;
